@@ -344,8 +344,16 @@ class LayoutPostprocessor:
                     contained.append(cluster)
 
             if contained:
-                # Sort contained clusters by minimum cell ID:
-                contained = self._sort_clusters(contained, mode="id")
+                # Form and Key-Value-Region wrap a label/value grid. Many PDF
+                # generators emit such a grid column by column, so the native
+                # cell order lists every label before any value and the pairing
+                # is only recoverable by counting positions. Sort those children
+                # in row-major reading order; Table and Picture keep the native
+                # order, which their own structure models rely on.
+                if special.label in [DocItemLabel.FORM, DocItemLabel.KEY_VALUE_REGION]:
+                    contained = self._sort_clusters(contained, mode="rows")
+                else:
+                    contained = self._sort_clusters(contained, mode="id")
                 special.children = contained
 
                 # Adjust bbox only for Form and Key-Value-Region, not Table or Picture
@@ -697,5 +705,37 @@ class LayoutPostprocessor:
             return sorted(
                 clusters, key=lambda cluster: (cluster.bbox.l, cluster.bbox.t)
             )
+        elif mode == "rows":  # Group into rows, then sort left-to-right within each
+            return self._sort_clusters_by_row(clusters)
         else:
             return clusters
+
+    @staticmethod
+    def _sort_clusters_by_row(clusters: list[Cluster]) -> list[Cluster]:
+        """Sort clusters row by row, left-to-right within each row.
+
+        Unlike the strict ``(top, left)`` order of ``tblr``, clusters are first
+        grouped into horizontal bands. Cells sharing a row are rarely aligned to
+        the exact same ``top`` (differing font sizes shift the baseline by a
+        fraction of a point), and a strict sort would place a slightly higher
+        cell of one row ahead of the entire preceding row.
+        """
+        if not clusters:
+            return []
+
+        heights = sorted(c.bbox.b - c.bbox.t for c in clusters)
+        median_height = heights[len(heights) // 2]
+        tolerance = max(1.0, median_height / 2)
+
+        rows: list[list[Cluster]] = []
+        for cluster in sorted(clusters, key=lambda c: (c.bbox.t, c.bbox.l)):
+            center = (cluster.bbox.t + cluster.bbox.b) / 2
+            for row in rows:
+                row_center = sum((c.bbox.t + c.bbox.b) / 2 for c in row) / len(row)
+                if abs(center - row_center) <= tolerance:
+                    row.append(cluster)
+                    break
+            else:
+                rows.append([cluster])
+
+        return [c for row in rows for c in sorted(row, key=lambda c: c.bbox.l)]
