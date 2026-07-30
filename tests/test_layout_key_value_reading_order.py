@@ -90,12 +90,27 @@ EXPECTED_READING_ORDER = [
 ]
 
 
-def _processor_with_key_value_grid(
+# La misma rejilla en un documento de derecha a izquierda: el generador escribe
+# la columna de más a la derecha primero, así que el índice de celda crece hacia
+# la izquierda. Ordenar cada fila por 'x' ascendente invertiría la lectura.
+_GRID_RTL = [
+    # (índice, texto,     left,  top)
+    (0, "valorA", 420.0, 100.0),  # fila 1, columna de la derecha (se escribe 1ª)
+    (1, "etiqA", 300.0, 100.0),  # fila 1, columna de la izquierda
+    (2, "valorB", 420.0, 120.0),  # fila 2, columna de la derecha
+    (3, "etiqB", 300.0, 120.0),  # fila 2, columna de la izquierda
+]
+
+EXPECTED_RTL_READING_ORDER = ["valorA", "etiqA", "valorB", "etiqB"]
+
+
+def _processor_with_grid(
+    grid: list[tuple[int, str, float, float]],
     label: DocItemLabel = DocItemLabel.KEY_VALUE_REGION,
 ) -> tuple[LayoutPostprocessor, Cluster]:
     children = [
         _child(cid=100 + index, cell=_text_cell(index, text, left, top))
-        for index, text, left, top in _GRID
+        for index, text, left, top in grid
     ]
     region = Cluster(
         id=1,
@@ -123,7 +138,7 @@ def _child_texts(region: Cluster) -> list[str]:
 
 def test_key_value_region_children_are_in_row_major_reading_order() -> None:
     """Cada etiqueta debe quedar seguida de su propio valor."""
-    processor, region = _processor_with_key_value_grid()
+    processor, region = _processor_with_grid(_GRID)
 
     processor._process_special_clusters()
 
@@ -135,7 +150,7 @@ def test_key_value_region_children_are_in_row_major_reading_order() -> None:
 
 def test_key_value_region_pairs_each_label_with_its_own_value() -> None:
     """El par concreto que motivó el arreglo: 'Tasa' junto a '14.45%'."""
-    processor, region = _processor_with_key_value_grid()
+    processor, region = _processor_with_grid(_GRID)
 
     processor._process_special_clusters()
 
@@ -144,9 +159,24 @@ def test_key_value_region_pairs_each_label_with_its_own_value() -> None:
     assert texts.index("090") == texts.index("Plazo") + 1
 
 
+def test_key_value_region_respects_right_to_left_documents() -> None:
+    """Agrupar por filas no debe imponer el sentido izquierda→derecha.
+
+    En un documento RTL el generador escribe la columna de la derecha primero.
+    El orden dentro de la fila lo marca el índice de celda nativo, no la 'x'.
+    """
+    processor, region = _processor_with_grid(_GRID_RTL)
+
+    processor._process_special_clusters()
+
+    assert _child_texts(region) == EXPECTED_RTL_READING_ORDER, (
+        "se invirtió el orden de lectura de un documento de derecha a izquierda"
+    )
+
+
 def test_picture_children_keep_native_cell_order() -> None:
     """El reordenado es solo para regiones clave-valor: PICTURE no se toca."""
-    processor, region = _processor_with_key_value_grid(label=DocItemLabel.PICTURE)
+    processor, region = _processor_with_grid(_GRID, label=DocItemLabel.PICTURE)
 
     processor._process_special_clusters()
 

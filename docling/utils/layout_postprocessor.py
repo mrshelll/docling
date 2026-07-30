@@ -705,20 +705,30 @@ class LayoutPostprocessor:
             return sorted(
                 clusters, key=lambda cluster: (cluster.bbox.l, cluster.bbox.t)
             )
-        elif mode == "rows":  # Group into rows, then sort left-to-right within each
+        elif mode == "rows":  # Group into rows, native cell order within each
             return self._sort_clusters_by_row(clusters)
         else:
             return clusters
 
     @staticmethod
     def _sort_clusters_by_row(clusters: list[Cluster]) -> list[Cluster]:
-        """Sort clusters row by row, left-to-right within each row.
+        """Sort clusters row by row, keeping the native cell order within a row.
 
         Unlike the strict ``(top, left)`` order of ``tblr``, clusters are first
         grouped into horizontal bands. Cells sharing a row are rarely aligned to
         the exact same ``top`` (differing font sizes shift the baseline by a
         fraction of a point), and a strict sort would place a slightly higher
         cell of one row ahead of the entire preceding row.
+
+        Rows are grouped by the ``top`` edge, not by the vertical center: a value
+        spanning several lines sits on the same row as its single-line label, and
+        their centers can be far apart even though their tops align.
+
+        Within a row the order comes from the native cell index, not from ``left``:
+        a right-to-left document is written right column first, so sorting by
+        ``left`` would reverse its reading order. The native index already carries
+        the writing direction, and for the column-major grids this mode targets it
+        still increases along each row.
         """
         if not clusters:
             return []
@@ -727,15 +737,17 @@ class LayoutPostprocessor:
         median_height = heights[len(heights) // 2]
         tolerance = max(1.0, median_height / 2)
 
+        def native_order(cluster: Cluster) -> int:
+            return min((cell.index for cell in cluster.cells), default=sys.maxsize)
+
         rows: list[list[Cluster]] = []
-        for cluster in sorted(clusters, key=lambda c: (c.bbox.t, c.bbox.l)):
-            center = (cluster.bbox.t + cluster.bbox.b) / 2
+        for cluster in sorted(clusters, key=lambda c: (c.bbox.t, native_order(c))):
             for row in rows:
-                row_center = sum((c.bbox.t + c.bbox.b) / 2 for c in row) / len(row)
-                if abs(center - row_center) <= tolerance:
+                row_top = sum(c.bbox.t for c in row) / len(row)
+                if abs(cluster.bbox.t - row_top) <= tolerance:
                     row.append(cluster)
                     break
             else:
                 rows.append([cluster])
 
-        return [c for row in rows for c in sorted(row, key=lambda c: c.bbox.l)]
+        return [c for row in rows for c in sorted(row, key=native_order)]
