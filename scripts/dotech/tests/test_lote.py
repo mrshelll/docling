@@ -42,3 +42,38 @@ def test_workflows_nuevos_ignora_los_propios():
 
 def test_log_vacio():
     assert parsear_log("") == []
+
+
+def test_movimientos_y_renombres_no_se_pierden(tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    from lote import main
+
+    def git(*a):
+        subprocess.run(["git", *a], check=True, capture_output=True, cwd=tmp_path)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "docling/utils").mkdir(parents=True)
+    (tmp_path / ".github/workflows").mkdir(parents=True)
+    (tmp_path / "docling/utils/layout_postprocessor.py").write_text("x = 1\n" * 20)
+    (tmp_path / ".github/workflows/viejo.yml").write_text("name: viejo\n" * 20)
+    git("add", ".")
+    git("commit", "-qm", "base")
+    git("tag", "v1")
+    git("mv", "docling/utils/layout_postprocessor.py", "docling/utils/otro.py")
+    git("commit", "-qm", "refactor: move layout postprocessor")
+    git("mv", ".github/workflows/viejo.yml", ".github/workflows/nuevo.yml")
+    git("commit", "-qm", "ci: rename workflow")
+    (tmp_path / "t.toml").write_text(
+        '[[arreglo]]\nclave = "bug2"\nnombre = "Bug 2"\nen_main = true\n'
+        'archivos = ["docling/utils/layout_postprocessor.py"]\n'
+        'test_comportamiento = "t.py"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    assert main(["--registro", "t.toml", "--desde", "v1", "--hasta", "HEAD", "--salida", "o.json"]) == 0
+    datos = json.loads((tmp_path / "o.json").read_text())
+    assert [c["titulo"] for c in datos["por_arreglo"]["bug2"]] == ["refactor: move layout postprocessor"]
+    assert datos["workflows_nuevos"] == [".github/workflows/nuevo.yml"]
