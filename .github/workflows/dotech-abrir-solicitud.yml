@@ -5,7 +5,8 @@
 # Separación de confianza: abrir y estado tienen la llave de la cuenta de
 # servicio y solo ejecutan gh y los scripts dotech del commit de este workflow
 # (github.sha); nunca código de la rama de la solicitud. Los tests, que sí
-# ejecutan esa rama, no ven la llave.
+# ejecutan esa rama, no ven la llave. Los secretos viven en el entorno `dotech`,
+# que solo admite ejecuciones desde `main`; solo abrir y estado lo declaran.
 name: dotech-abrir-solicitud
 
 on:
@@ -24,6 +25,7 @@ permissions:
 jobs:
   # Código: solo gh, sin checkout. Secretos: llave de la cuenta de servicio.
   abrir:
+    environment: dotech
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -82,8 +84,9 @@ jobs:
   estado:
     needs: [abrir, tests-original, tests-nuestra]
     if: always() && needs.abrir.result == 'success'
+    environment: dotech
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     env:
       SHA: ${{ needs.abrir.outputs.sha }}
       MAIN: ${{ needs.abrir.outputs.main }}
@@ -126,12 +129,29 @@ jobs:
           print(f"estado={estado}")
           print(f"descripcion={descripcion}")
           PY
+      # Marcas de conflicto en archivos que ningún test toca no deben salir en verde.
+      # Se leen los objetos del commit con git grep; no se ejecuta nada de ese árbol.
+      - id: marcas
+        name: Buscar marcas de conflicto
+        run: |
+          git fetch --quiet --no-tags --depth=1 origin "$SHA"
+          if git grep -lE '^(<<<<<<<|>>>>>>>)( |$)' "$SHA" -- ; then
+            echo "::error::La rama de la solicitud tiene marcas de conflicto."
+            echo "hay=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hay=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publicar estados
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           ESTADO: ${{ steps.atribuir.outputs.estado }}
           DESCRIPCION: ${{ steps.atribuir.outputs.descripcion }}
+          MARCAS: ${{ steps.marcas.outputs.hay }}
         run: |
+          if [ "$MARCAS" != "false" ]; then
+            ESTADO=failure
+            DESCRIPCION="La rama tiene marcas de conflicto (<<<<<<< / >>>>>>>) sin resolver"
+          fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
             -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \

@@ -10,6 +10,10 @@
 #   donde corre Claude, su token OAuth.
 # - preparar no publica: entrega la rama como git bundle y publicar-rama la
 #   empuja desde un runner limpio.
+# - Los tres secretos viven en el entorno `dotech`, que solo admite ejecuciones
+#   desde `main`: un workflow que llegue con la rama sincronizada (o un
+#   dotech-*.yml retocado en ella) no los ve. Solo los jobs que los leen declaran
+#   `environment: dotech`; dotech-pruebas no ve ninguno.
 name: dotech-vigia
 
 on:
@@ -42,6 +46,7 @@ env:
 jobs:
   # Código: scripts dotech de github.sha. Secretos: llave de la cuenta de servicio.
   decidir:
+    environment: dotech
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -93,6 +98,7 @@ jobs:
   preparar:
     needs: decidir
     if: needs.decidir.outputs.accion == 'sincronizar'
+    environment: dotech
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
@@ -224,6 +230,7 @@ jobs:
   # ejecuta. Secretos: llave de la cuenta de servicio.
   publicar-rama:
     needs: [decidir, preparar]
+    environment: dotech
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -352,6 +359,7 @@ jobs:
   explicar:
     needs: [decidir, publicar-rama, comparar]
     if: always() && needs.comparar.outputs.hay_nuestras == 'true'
+    environment: dotech
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -405,6 +413,7 @@ jobs:
   publicar:
     needs: [decidir, preparar, publicar-rama, comparar, explicar]
     if: always() && needs.publicar-rama.result == 'success'
+    environment: dotech
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
