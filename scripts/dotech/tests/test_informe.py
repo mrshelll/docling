@@ -54,7 +54,7 @@ def test_cuerpo_contiene_lo_que_necesitan_los_revisores():
     assert "Sobra: el original ya lo resuelve" in texto            # bug1
     assert "Sigue haciendo falta" in texto                          # bug2
     assert "`t::b`" in texto and "assert 1 == 2" in texto           # fallo nuestro
-    assert "https://github.com/docling-project/docling/pull/4276" in texto
+    assert "`docling-project/docling#4276`" in texto                 # sin enlace al original
     assert "ddd12345" in texto                                       # cambio sin PR
     assert ".github/workflows/nuevo.yml" in texto
     assert "docling-validar" in texto
