@@ -71,3 +71,56 @@ def test_cuerpo_con_conflicto_y_explicacion():
 
 def test_cuerpo_con_corrida_rota():
     assert "Corridas rotas" in _cuerpo(comparacion=ROTA)
+
+
+def _sin_codigo(texto):
+    import re
+    return re.sub(r"`[^`]*`", "", texto)
+
+
+def test_no_enlaza_ni_menciona_al_original():
+    texto = _cuerpo()
+    assert "https://github.com/docling-project" not in texto
+    assert "`docling-project/docling#4276`" in texto
+    assert "(#4276)" not in texto   # el sufijo del título se quita si hay pr
+    import re
+    assert not re.search(r"#\d", _sin_codigo(texto))
+
+
+def test_neutraliza_menciones_y_html():
+    lote = {"por_arreglo": {"bug2": [{"sha": "aaa", "titulo": "fix: cc @alguien <b>", "pr": 1}]},
+            "areas": [], "workflows_nuevos": []}
+    comp = dict(CON_NUESTRAS, mensajes={"t::b": "</details> @otro <script>"})
+    texto = _cuerpo(lote=lote, comparacion=comp, explicacion="Fixes #3\nhola @x <i>")
+    assert "@alguien" not in texto and "@otro" not in texto and "@x" not in texto
+    assert "@​alguien" in texto
+    assert "</details> @" not in texto and "<script>" not in texto and "<b>" not in texto
+    assert "&lt;/details&gt;" in texto
+    assert "#3" not in texto and "#​3" in texto
+    assert "> Fixes" in texto and "> hola" in texto
+
+
+@pytest.mark.parametrize("crudo", ["no es json", "[1, 2]", '"x"', "3"])
+def test_main_tolera_resumen_malformado(tmp_path, monkeypatch, capsys, crudo):
+    import json
+    from informe import main
+    (tmp_path / "c.json").write_text(json.dumps(LIMPIA))
+    (tmp_path / "l.json").write_text(json.dumps(LOTE))
+    (tmp_path / "r.toml").write_text("")
+    monkeypatch.setattr("informe.cargar", lambda _: ARREGLOS)
+    monkeypatch.setenv("CONFLICTO", "true")
+    monkeypatch.setenv("RESUMEN_CONFLICTO", crudo)
+    rc = main(["--registro", str(tmp_path / "r.toml"), "--tag", "v2.136.0", "--tag-anterior", "v2.135.0",
+               "--comparacion", str(tmp_path / "c.json"), "--sobra", str(tmp_path / "s.json"),
+               "--lote", str(tmp_path / "l.json"), "--enlace", "https://run",
+               "--salida-cuerpo", str(tmp_path / "out.md")])
+    salida = capsys.readouterr().out
+    assert rc == 0
+    assert "estado=failure" in salida
+    assert "titulo=[conflicto para revisar a mano] Pasar a v2.136.0" in salida
+
+
+def test_entradas_de_archivos_incompletas():
+    resumen = {"resuelto": True, "archivos": ["suelto", {"archivo": "a.py"}, {}]}
+    texto = _cuerpo(conflicto=True, resumen_conflicto=resumen)
+    assert "`a.py`" in texto

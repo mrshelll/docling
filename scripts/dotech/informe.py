@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 
 from registro import Arreglo, cargar
 
-URL_PR = "https://github.com/docling-project/docling/pull/{}"
+# Nada se enlaza ni menciona al original: GitHub crearía referencias cruzadas y avisos allí.
+REF_PR = "`docling-project/docling#{}`"
 VEREDICTOS = {
     "sobra": "Sobra: el original ya lo resuelve. Proponer retirarlo.",
     "hace_falta": "Sigue haciendo falta.",
@@ -40,13 +42,24 @@ def estado_tests(comparacion: dict, conflicto: bool, resumen_conflicto: dict | N
     return "success", f"Sin fallos nuestros ({len(comparacion['del_original'])} del original)"
 
 
+def _seguro(texto: str) -> str:
+    """Neutraliza menciones, referencias `#N` y HTML en texto que no controlamos."""
+    texto = str(texto).replace("@", "@\u200b").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"#(?=\d)", "#\u200b", texto)
+
+
 def _celda(texto: str) -> str:
-    return " ".join(str(texto).split()).replace("|", "\\|")
+    return _seguro(" ".join(str(texto).split())).replace("|", "\\|")
 
 
 def _cambio(c: dict) -> str:
-    ref = f"[#{c['pr']}]({URL_PR.format(c['pr'])})" if c.get("pr") else f"`{c['sha'][:8]}`"
-    return f"- {_celda(c['titulo'])} ({ref})"
+    titulo_ = c["titulo"]
+    if c.get("pr"):
+        titulo_ = re.sub(r"\s*\(#\d+\)\s*$", "", titulo_)
+        ref = REF_PR.format(c["pr"])
+    else:
+        ref = f"`{c['sha'][:8]}`"
+    return f"- {_celda(titulo_)} ({ref})"
 
 
 def cuerpo(
@@ -73,7 +86,8 @@ def cuerpo(
     l += [f"- `{tid}`" for tid in comparacion["del_original"]]
     l += ["", "</details>"]
     if explicacion:
-        l += ["", "### Causa probable (Claude Haiku)", "", explicacion.strip()]
+        l += ["", "### Causa probable (Claude Haiku)", ""]
+        l += [f"> {_seguro(linea)}".rstrip() for linea in explicacion.strip().splitlines()]
 
     l += ["", "## Cambios del lote que nos tocan", ""]
     por_nombre = {a.clave: a.nombre for a in arreglos}
@@ -97,10 +111,11 @@ def cuerpo(
         if not _conflicto_resuelto(resumen_conflicto):
             l += ["**Claude no lo dio por resuelto.** Revisar a mano.", ""]
         archivos = (resumen_conflicto or {}).get("archivos", [])
+        archivos = [x for x in archivos if isinstance(x, dict)] if isinstance(archivos, list) else []
         if archivos:
             l += ["| archivo | qué cambió el original | qué decidió | tests |", "|---|---|---|---|"]
-            l += [f"| `{_celda(x['archivo'])}` | {_celda(x['original'])} | "
-                  f"{_celda(x['decision'])} | {_celda(x['tests'])} |" for x in archivos]
+            l += [f"| `{_celda(x.get('archivo', ''))}` | {_celda(x.get('original', ''))} | "
+                  f"{_celda(x.get('decision', ''))} | {_celda(x.get('tests', ''))} |" for x in archivos]
             l.append("")
 
     l += ["## Antes de aprobar", "",
@@ -124,7 +139,12 @@ def main(argv: list[str] | None = None) -> int:
 
     conflicto = os.environ.get("CONFLICTO", "false") == "true"
     crudo = os.environ.get("RESUMEN_CONFLICTO", "").strip()
-    resumen = json.loads(crudo) if crudo else None
+    try:
+        resumen = json.loads(crudo) if crudo else None
+    except ValueError:
+        resumen = None
+    if not isinstance(resumen, dict):
+        resumen = None
     comparacion = _json(a.comparacion)
     sobra = _json(a.sobra) if a.sobra.exists() else {}
 
