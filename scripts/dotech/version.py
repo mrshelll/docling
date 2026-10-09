@@ -29,6 +29,31 @@ def tag_de_titulo(titulo: str) -> str | None:
     return m.group(1) if m else None
 
 
+_CAMPOS_ORIGEN = "isCrossRepository,headRepositoryOwner"
+_LIMITE_CERRADAS = 20
+
+
+def solicitudes_propias(solicitudes: list[dict], dueno: str) -> list[dict]:
+    """Deja solo las solicitudes cuya rama vive en el propio repo.
+
+    `gh pr list --head` filtra por nombre de rama, no por repo: un fork ajeno con
+    una rama del mismo nombre también casa. Ante la duda (campos ausentes) se descarta.
+    """
+    return [
+        s for s in solicitudes
+        if s.get("isCrossRepository") is False
+        and ((s.get("headRepositoryOwner") or {}).get("login") or "").lower() == dueno.lower()
+    ]
+
+
+def tag_rechazado(cerradas: list[dict], dueno: str) -> str | None:
+    """Versión de la última solicitud propia cerrada sin integrar, si la hay."""
+    propias = solicitudes_propias(cerradas, dueno)
+    if not propias or propias[0].get("mergedAt"):
+        return None
+    return tag_de_titulo(propias[0].get("title") or "")
+
+
 def decidir(
     tag: str,
     *,
@@ -74,23 +99,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rama", required=True)
     ap.add_argument("--ref", default="")
     a = ap.parse_args(argv)
+    partes = a.repo.strip("/").split("/")
+    if len(partes) < 2 or not partes[-2]:
+        ap.error(f"--repo debe ser DUEÑO/REPO: {a.repo!r}")
+    dueno = partes[-2]
 
     tag = a.ref or _salida(
         "gh", "api", f"repos/{a.upstream}/releases/latest", "--jq", ".tag_name"
     )
-    abiertas = json.loads(_salida(
+    abiertas = solicitudes_propias(json.loads(_salida(
         "gh", "pr", "list", "-R", a.repo, "--head", a.rama,
-        "--state", "open", "--json", "number",
-    ))
-    cerradas = json.loads(_salida(
+        "--state", "open", "--json", f"number,{_CAMPOS_ORIGEN}",
+    )), dueno)
+    rechazado = tag_rechazado(json.loads(_salida(
         "gh", "pr", "list", "-R", a.repo, "--head", a.rama,
-        "--state", "closed", "--limit", "1", "--json", "title,mergedAt",
-    ))
-    rechazado = (
-        tag_de_titulo(cerradas[0]["title"])
-        if cerradas and not cerradas[0]["mergedAt"]
-        else None
-    )
+        "--state", "closed", "--limit", str(_LIMITE_CERRADAS),
+        "--json", f"title,mergedAt,{_CAMPOS_ORIGEN}",
+    )), dueno)
     existe_rama = _ejecutar(
         "git", "ls-remote", "--exit-code", "--heads", "origin", a.rama
     ).returncode == 0
