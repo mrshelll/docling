@@ -1,6 +1,11 @@
 # Abre una solicitud a main con la cuenta de servicio y le pasa los tests.
 # Con la regla de dos aprobaciones, una solicitud abierta por Miguel solo podría
 # aprobarla Fabio; abierta por la cuenta de servicio, la aprueban los dos.
+#
+# Separación de confianza: abrir y estado tienen la llave de la cuenta de
+# servicio y solo ejecutan gh y los scripts dotech del commit de este workflow
+# (github.sha); nunca código de la rama de la solicitud. Los tests, que sí
+# ejecutan esa rama, no ven la llave.
 name: dotech-abrir-solicitud
 
 on:
@@ -17,6 +22,7 @@ permissions:
   contents: read
 
 jobs:
+  # Código: solo gh, sin checkout. Secretos: llave de la cuenta de servicio.
   abrir:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -52,6 +58,7 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "main=$main" >> "$GITHUB_OUTPUT"
 
+  # Código: main y la rama de la solicitud. Secretos: ninguno (GITHUB_TOKEN de lectura).
   tests-original:
     needs: abrir
     uses: ./.github/workflows/dotech-pruebas.yml
@@ -70,6 +77,8 @@ jobs:
       ref: ${{ needs.abrir.outputs.sha }}
       sha_nuestra: ${{ needs.abrir.outputs.sha }}
 
+  # Código: scripts dotech de github.sha sobre los resultados (datos).
+  # Secretos: llave de la cuenta de servicio.
   estado:
     needs: [abrir, tests-original, tests-nuestra]
     if: always() && needs.abrir.result == 'success'
@@ -87,7 +96,7 @@ jobs:
           private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.abrir.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -109,7 +118,7 @@ jobs:
           mkdir -p artefactos/tests-original artefactos/tests-nuestra
           python3 scripts/dotech/comparar_junit.py --original artefactos/tests-original \
             --nuestra artefactos/tests-nuestra --salida comparacion.json
-          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
           import json, sys
           sys.path.insert(0, "scripts/dotech")
           from informe import estado_tests

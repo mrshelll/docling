@@ -1,5 +1,8 @@
 # Una corrida de tests de un lado (el original o nuestra rama). La llaman
 # dotech-vigia y dotech-abrir-solicitud. Nunca arranca por eventos de terceros.
+#
+# Ejecuta el árbol probado (y sus scripts dotech): por eso no recibe ningún
+# secreto, solo el GITHUB_TOKEN de lectura, y no guarda credenciales en git.
 name: dotech-pruebas
 
 on:

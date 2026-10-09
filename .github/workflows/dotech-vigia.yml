@@ -1,8 +1,15 @@
 # Vigila las versiones del original y las lleva a una solicitud de cambio.
 # Ver docs/superpowers/specs/2026-10-08-sincronizacion-upstream-design.md (en ~/Markitdown).
 #
-# Ningún paso que ejecute código del original o de Claude tiene a mano un token
-# con escritura: el de la cuenta de servicio se pide justo antes de publicar.
+# Separación de confianza, job por job:
+# - Los jobs con la llave de la cuenta de servicio (decidir, publicar-rama,
+#   publicar) solo ejecutan los scripts dotech del commit de este workflow
+#   (github.sha), git sin hooks o gh. Nunca código del árbol mezclado.
+# - Los jobs que ejecutan el árbol mezclado o en los que corre Claude (preparar,
+#   tests-*, explicar) no ven esa llave: solo el token de lectura del flujo y,
+#   donde corre Claude, su token OAuth.
+# - preparar no publica: entrega la rama como git bundle y publicar-rama la
+#   empuja desde un runner limpio.
 name: dotech-vigia
 
 on:
@@ -33,6 +40,7 @@ env:
   SIMULAR: ${{ inputs.simular == true }}
 
 jobs:
+  # Código: scripts dotech de github.sha. Secretos: llave de la cuenta de servicio.
   decidir:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -42,6 +50,8 @@ jobs:
       base: ${{ steps.decision.outputs.base }}
       tag_anterior: ${{ steps.decision.outputs.tag_anterior }}
       rama_huerfana: ${{ steps.decision.outputs.rama_huerfana }}
+      autor_nombre: ${{ steps.autor.outputs.nombre }}
+      autor_correo: ${{ steps.autor.outputs.correo }}
     steps:
       - id: app
         uses: actions/create-github-app-token@v2
@@ -50,8 +60,18 @@ jobs:
           private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
       - uses: actions/checkout@v6
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      - id: autor
+        name: Identidad git de la cuenta de servicio
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "nombre=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "correo=${id}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
       - name: Apagar automatismos heredados
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -68,43 +88,30 @@ jobs:
           REF_MANUAL: ${{ inputs.ref }}
         run: python3 scripts/dotech/version.py --repo "$GITHUB_REPOSITORY" --upstream "$UPSTREAM" --rama "$RAMA" --ref "$REF_MANUAL" >> "$GITHUB_OUTPUT"
 
+  # Código: árbol mezclado (setup-ubuntu-ci, tests) y Claude con Edit.
+  # Secretos: CLAUDE_CODE_OAUTH_TOKEN; GITHUB_TOKEN de solo lectura. Sin llave de la App.
   preparar:
     needs: decidir
     if: needs.decidir.outputs.accion == 'sincronizar'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
-      sha: ${{ steps.rama.outputs.sha }}
-      destino: ${{ steps.rama.outputs.destino }}
+      sha: ${{ steps.paquete.outputs.sha }}
       conflicto: ${{ steps.merge.outputs.conflicto }}
-      resumen_conflicto: ${{ steps.claude.outputs.structured_output }}
+      resumen_conflicto: ${{ steps.cerrar.outputs.resumen }}
+    env:
+      NOMBRE: ${{ needs.decidir.outputs.autor_nombre }}
+      CORREO: ${{ needs.decidir.outputs.autor_correo }}
+      BASE: ${{ needs.decidir.outputs.base }}
     steps:
-      # Solo para conocer el nombre de la cuenta de servicio; se revoca en el
-      # paso siguiente, antes de que corra nada del original ni Claude.
-      - id: identidad
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.DOTECH_APP_ID }}
-          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
-          skip-token-revoke: "true"
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
-      - id: autor
-        name: Identidad de la cuenta de servicio
-        env:
-          GH_TOKEN: ${{ steps.identidad.outputs.token }}
-          SLUG: ${{ steps.identidad.outputs.app-slug }}
+      - name: Identidad y original
         run: |
-          id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
-          gh api -X DELETE /installation/token
-          nombre="${SLUG}[bot]"
-          correo="${id}+${SLUG}[bot]@users.noreply.github.com"
-          git config user.name "$nombre"
-          git config user.email "$correo"
-          echo "nombre=$nombre" >> "$GITHUB_OUTPUT"
-          echo "correo=$correo" >> "$GITHUB_OUTPUT"
+          git config user.name "$NOMBRE"
+          git config user.email "$CORREO"
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch --quiet --tags upstream
           git fetch --quiet origin "$RAMA" 2>/dev/null || true
@@ -112,7 +119,6 @@ jobs:
         name: Mezclar la versión
         env:
           TAG: ${{ needs.decidir.outputs.tag }}
-          BASE: ${{ needs.decidir.outputs.base }}
         run: |
           git switch -C trabajo "origin/$BASE"
           if git merge --no-ff --no-edit -m "chore: merge upstream $TAG" "$TAG"; then
@@ -136,8 +142,9 @@ jobs:
           uv_sync_args: --frozen --group dev --all-extras --all-packages --no-group docs --no-group examples
           install_system_deps: "true"
           cache_models: "true"
-      # continue-on-error: si Claude falla o no devuelve el resumen, el merge sigue y
+      # Un solo intento. continue-on-error: si Claude falla o no devuelve el resumen,
       # el informe sale como «Claude no dio por resuelto el conflicto» (estado rojo).
+      # --setting-sources user: los ajustes de .claude/ del árbol mezclado no cuentan.
       - id: claude
         name: Claude resuelve el conflicto
         if: steps.merge.outputs.conflicto == 'true'
@@ -171,28 +178,62 @@ jobs:
           claude_args: >-
             --model claude-sonnet-5-5
             --max-turns 40
+            --setting-sources user
             --allowedTools "Read,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(uv run --no-sync pytest:*)"
             --json-schema '{"type":"object","properties":{"resuelto":{"type":"boolean"},"archivos":{"type":"array","items":{"type":"object","properties":{"archivo":{"type":"string"},"original":{"type":"string"},"decision":{"type":"string"},"tests":{"type":"string"}},"required":["archivo","original","decision","tests"]}}},"required":["resuelto","archivos"]}'
-      # La acción de Claude cambia user.name/user.email a claude[bot]: el commit del
-      # merge vuelve a firmarse con la cuenta de servicio.
-      - name: Cerrar el merge
+      # Si quedan marcas se commitea igual y el resumen se vacía (= no resuelto): la
+      # solicitud sale en rojo y para revisar a mano, y la siguiente ejecución ve la
+      # versión ya en la rama y no vuelve a llamar a Claude. La acción de Claude
+      # cambia user.name/user.email a claude[bot]: se restaura la cuenta de servicio.
+      - id: cerrar
+        name: Cerrar el merge
         if: steps.merge.outputs.conflicto == 'true'
         env:
-          NOMBRE: ${{ steps.autor.outputs.nombre }}
-          CORREO: ${{ steps.autor.outputs.correo }}
+          SALIDA_CLAUDE: ${{ steps.claude.outputs.structured_output }}
         run: |
-          if git grep -nE '^(<<<<<<<|>>>>>>>)( |$)' -- . ; then
-            echo "::error::Quedan marcas de conflicto: hay que resolverlo a mano."
-            exit 1
+          resumen="$SALIDA_CLAUDE"
+          if git grep -lE '^(<<<<<<<|>>>>>>>)( |$)' -- . ; then
+            echo "::warning::Quedan marcas de conflicto en esos archivos: la solicitud sale para revisar a mano."
+            resumen=""
           fi
           git add -u
           if [ -n "$(git ls-files -u)" ]; then
-            echo "::error::Quedan archivos sin resolver: hay que resolverlo a mano."
+            echo "::error::Quedan rutas sin resolver en el índice."
             exit 1
           fi
           git config user.name "$NOMBRE"
           git config user.email "$CORREO"
-          git commit --no-edit
+          git -c core.hooksPath=/dev/null commit --no-edit
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "resumen<<$delim"; printf '%s\n' "$resumen"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+      - id: paquete
+        name: Empaquetar la rama
+        run: |
+          mkdir -p "$RUNNER_TEMP/rama"
+          rm -f "$RUNNER_TEMP/rama/rama.bundle"
+          git bundle create "$RUNNER_TEMP/rama/rama.bundle" trabajo "^origin/$BASE"
+          echo "sha=$(git rev-parse trabajo)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rama-mezclada
+          path: ${{ runner.temp }}/rama/rama.bundle
+          if-no-files-found: error
+          overwrite: true
+
+  # Código: solo git (sin hooks) y gh, en un repo vacío; nada del árbol mezclado se
+  # ejecuta. Secretos: llave de la cuenta de servicio.
+  publicar-rama:
+    needs: [decidir, preparar]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha: ${{ steps.rama.outputs.sha }}
+      destino: ${{ steps.rama.outputs.destino }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rama-mezclada
+          path: ${{ runner.temp }}/rama
       - id: app
         uses: actions/create-github-app-token@v2
         with:
@@ -202,39 +243,61 @@ jobs:
         name: Publicar la rama
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ needs.decidir.outputs.base }}
           HUERFANA: ${{ needs.decidir.outputs.rama_huerfana }}
+          SHA_ESPERADO: ${{ needs.preparar.outputs.sha }}
         run: |
           if [ "$SIMULAR" = "true" ]; then destino=dotech/sync-prueba; else destino="$RAMA"; fi
-          git remote set-url origin "https://x-access-token:${GH_TOKEN}@${GITHUB_SERVER_URL#https://}/${GITHUB_REPOSITORY}.git"
-          if [ "$SIMULAR" = "true" ] || [ "$HUERFANA" = "true" ]; then
-            git push --quiet origin --delete "$destino" 2>/dev/null || true
+          remoto="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git init -q "$RUNNER_TEMP/repo"
+          cd "$RUNNER_TEMP/repo"
+          git config core.hooksPath /dev/null
+          git fetch --quiet --no-tags "$remoto" "refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git bundle verify -q "$RUNNER_TEMP/rama/rama.bundle"
+          git fetch --quiet --no-tags "$RUNNER_TEMP/rama/rama.bundle" "refs/heads/trabajo:refs/heads/trabajo"
+          sha=$(git rev-parse refs/heads/trabajo)
+          if [ "$sha" != "$SHA_ESPERADO" ]; then
+            echo "::error::El bundle trae $sha y preparar anunció $SHA_ESPERADO."
+            exit 1
           fi
-          git push --quiet origin "HEAD:refs/heads/$destino"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          empujar() {
+            git -c core.hooksPath=/dev/null \
+              -c "http.$GITHUB_SERVER_URL/.extraheader=AUTHORIZATION: basic $auth" \
+              push --quiet "$remoto" "$@"
+          }
+          if [ "$SIMULAR" = "true" ] || [ "$HUERFANA" = "true" ]; then
+            empujar --delete "refs/heads/$destino" 2>/dev/null || true
+          fi
+          empujar "$sha:refs/heads/$destino"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "destino=$destino" >> "$GITHUB_OUTPUT"
 
+  # Código: árbol del original y árbol mezclado. Secretos: ninguno (GITHUB_TOKEN de lectura).
   tests-original:
-    needs: [decidir, preparar]
+    needs: [decidir, publicar-rama]
     uses: ./.github/workflows/dotech-pruebas.yml
     with:
       lado: original
       repositorio: docling-project/docling
       ref: ${{ needs.decidir.outputs.tag }}
-      sha_nuestra: ${{ needs.preparar.outputs.sha }}
+      sha_nuestra: ${{ needs.publicar-rama.outputs.sha }}
       evaluar_sobra: true
 
   tests-nuestra:
-    needs: [decidir, preparar]
+    needs: [decidir, publicar-rama]
     uses: ./.github/workflows/dotech-pruebas.yml
     with:
       lado: nuestra
       repositorio: ${{ github.repository }}
-      ref: ${{ needs.preparar.outputs.sha }}
-      sha_nuestra: ${{ needs.preparar.outputs.sha }}
+      ref: ${{ needs.publicar-rama.outputs.sha }}
+      sha_nuestra: ${{ needs.publicar-rama.outputs.sha }}
 
+  # Código: scripts dotech de github.sha sobre los resultados (datos). Secretos: ninguno.
   comparar:
-    needs: [decidir, preparar, tests-original, tests-nuestra]
-    if: always() && needs.preparar.result == 'success'
+    needs: [decidir, publicar-rama, tests-original, tests-nuestra]
+    if: always() && needs.publicar-rama.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -242,7 +305,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.preparar.outputs.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
@@ -254,7 +317,7 @@ jobs:
         env:
           TAG: ${{ needs.decidir.outputs.tag }}
           TAG_ANTERIOR: ${{ needs.decidir.outputs.tag_anterior }}
-          SHA: ${{ needs.preparar.outputs.sha }}
+          SHA: ${{ needs.publicar-rama.outputs.sha }}
         run: |
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch --quiet --tags upstream
@@ -284,8 +347,10 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+  # Código: Claude en solo lectura sobre el árbol mezclado.
+  # Secretos: CLAUDE_CODE_OAUTH_TOKEN; GITHUB_TOKEN de lectura. Sin llave de la App.
   explicar:
-    needs: [decidir, preparar, comparar]
+    needs: [decidir, publicar-rama, comparar]
     if: always() && needs.comparar.outputs.hay_nuestras == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -294,14 +359,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.preparar.outputs.sha }}
+          ref: ${{ needs.publicar-rama.outputs.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: informe-datos
-      # Solo lectura: basta el token del propio flujo. Si Claude falla, la
-      # solicitud sale sin explicación, no sin informe.
+      # Si Claude falla, la solicitud sale sin explicación, no sin informe.
       - id: claude
         name: Claude explica los fallos nuestros
         continue-on-error: true
@@ -321,6 +385,7 @@ jobs:
           claude_args: >-
             --model claude-haiku-5-5
             --max-turns 5
+            --setting-sources user
             --allowedTools "Read,Glob,Grep,Bash(git log:*),Bash(git show:*)"
             --json-schema '{"type":"object","properties":{"explicacion":{"type":"string"}},"required":["explicacion"]}'
       - id: texto
@@ -335,13 +400,16 @@ jobs:
           delim="FIN_$(openssl rand -hex 16)"
           { echo "explicacion<<$delim"; printf '%s\n' "$explicacion"; echo "$delim"; } >> "$GITHUB_OUTPUT"
 
+  # Código: scripts dotech y registro de github.sha sobre los datos del informe.
+  # Secretos: llave de la cuenta de servicio.
   publicar:
-    needs: [decidir, preparar, comparar, explicar]
-    if: always() && needs.preparar.result == 'success'
+    needs: [decidir, preparar, publicar-rama, comparar, explicar]
+    if: always() && needs.publicar-rama.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      SHA: ${{ needs.preparar.outputs.sha }}
+      SHA: ${{ needs.publicar-rama.outputs.sha }}
+      TAG: ${{ needs.decidir.outputs.tag }}
       ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - id: app
@@ -361,38 +429,40 @@ jobs:
           fi
       - uses: actions/checkout@v6
         with:
-          ref: ${{ needs.preparar.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: informe-datos
+          path: ${{ runner.temp }}/datos
       - id: informe
         name: Escribir el informe
         env:
           CONFLICTO: ${{ needs.preparar.outputs.conflicto }}
           RESUMEN_CONFLICTO: ${{ needs.preparar.outputs.resumen_conflicto }}
           EXPLICACION: ${{ needs.explicar.outputs.explicacion }}
-          TAG: ${{ needs.decidir.outputs.tag }}
           TAG_ANTERIOR: ${{ needs.decidir.outputs.tag_anterior }}
         run: |
+          d="$RUNNER_TEMP/datos"
           python3 scripts/dotech/informe.py --registro scripts/dotech/arreglos.toml \
-            --tag "$TAG" --tag-anterior "$TAG_ANTERIOR" --comparacion comparacion.json \
-            --sobra sobra.json --lote lote.json --enlace "$ENLACE" \
-            --salida-cuerpo cuerpo.md >> "$GITHUB_OUTPUT"
-          cat cuerpo.md >> "$GITHUB_STEP_SUMMARY"
+            --tag "$TAG" --tag-anterior "$TAG_ANTERIOR" --comparacion "$d/comparacion.json" \
+            --sobra "$d/sobra.json" --lote "$d/lote.json" --enlace "$ENLACE" \
+            --salida-cuerpo "$d/cuerpo.md" >> "$GITHUB_OUTPUT"
+          cat "$d/cuerpo.md" >> "$GITHUB_STEP_SUMMARY"
       - name: Abrir o actualizar la solicitud
         if: env.SIMULAR != 'true'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           TITULO: ${{ steps.informe.outputs.titulo }}
         run: |
+          cuerpo="$RUNNER_TEMP/datos/cuerpo.md"
           numero=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$RAMA" --base main --state open \
             --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')
           if [ -z "$numero" ]; then
             gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$RAMA" \
-              --title "$TITULO" --body-file cuerpo.md --reviewer mrshelll,alejojau
+              --title "$TITULO" --body-file "$cuerpo" --reviewer mrshelll,alejojau
           else
-            gh pr edit "$numero" -R "$GITHUB_REPOSITORY" --title "$TITULO" --body-file cuerpo.md
+            gh pr edit "$numero" -R "$GITHUB_REPOSITORY" --title "$TITULO" --body-file "$cuerpo"
           fi
       - name: Estados del commit
         if: env.SIMULAR != 'true'
@@ -405,6 +475,8 @@ jobs:
             -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
             -f context=dotech/validacion-local -f description="Falta docling-validar en el Mac de Miguel"
+      # Si ya había una solicitud abierta, su título pasa a la versión nueva con la
+      # marca de revisión a mano (el mismo formato que informe.titulo).
       - name: Marcar el fallo en el commit
         if: failure() && env.SIMULAR != 'true'
         env:
@@ -413,6 +485,11 @@ jobs:
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=failure \
             -f context=dotech/tests -f description="La sincronización falló antes de publicar el informe" \
             -f target_url="$ENLACE"
+          numero=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$RAMA" --base main --state open \
+            --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')
+          if [ -n "$numero" ]; then
+            gh pr edit "$numero" -R "$GITHUB_REPOSITORY" --title "[conflicto para revisar a mano] Pasar a $TAG"
+          fi
       - name: Limpiar la simulación
         if: always() && env.SIMULAR == 'true'
         env:
