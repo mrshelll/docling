@@ -104,7 +104,7 @@ def main(argv: list[str] | None = None) -> int:
         tag_rechazado=rechazado,
     )
     tag_anterior = _salida(
-        "git", "describe", "--tags", "--abbrev=0", "--match", "v*", f"origin/{d.base}"
+        "git", "describe", "--tags", "--abbrev=0", "--match", "v*", "origin/main"
     )
     print(f"accion={d.accion}")
     print(f"tag={d.tag}")
