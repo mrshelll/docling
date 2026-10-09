@@ -31,6 +31,7 @@ jobs:
     outputs:
       sha: ${{ steps.datos.outputs.sha }}
       main: ${{ steps.datos.outputs.main }}
+      numero: ${{ steps.datos.outputs.numero }}
     steps:
       - id: app
         uses: actions/create-github-app-token@v2
@@ -57,8 +58,7 @@ jobs:
           fi
           sha=$(gh pr view "$numero" -R "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
           main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "main=$main" >> "$GITHUB_OUTPUT"
+          { echo "sha=$sha"; echo "main=$main"; echo "numero=$numero"; } >> "$GITHUB_OUTPUT"
 
   # Código: main y la rama de la solicitud. Secretos: ninguno (GITHUB_TOKEN de lectura).
   tests-original:
@@ -90,6 +90,7 @@ jobs:
     env:
       SHA: ${{ needs.abrir.outputs.sha }}
       MAIN: ${{ needs.abrir.outputs.main }}
+      NUMERO: ${{ needs.abrir.outputs.numero }}
       ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - id: app
@@ -105,8 +106,35 @@ jobs:
         with:
           pattern: tests-*
           path: artefactos
+      # Marcas de conflicto en archivos que ningún test toca no deben salir en verde.
+      # Se leen los objetos del commit con git grep; no se ejecuta nada de ese árbol.
+      - id: marcas
+        name: Buscar marcas de conflicto
+        run: |
+          git fetch --quiet --no-tags --depth=1 origin "$SHA"
+          rc=0
+          git grep -lE '^(<<<<<<<|>>>>>>>)( |$)' "$SHA" -- || rc=$?
+          case "$rc" in
+            0) echo "::error::La rama de la solicitud tiene marcas de conflicto."
+               echo "hay=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "hay=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::git grep falló (código $rc) al buscar marcas de conflicto."
+               exit 1 ;;
+          esac
+      # Mientras el título lleve la marca de revisión a mano, dotech/tests sale en rojo:
+      # la quita una persona después de revisar. Se lee justo antes de publicar.
+      - id: solicitud
+        name: Leer el título de la solicitud
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "titulo<<$delim"; gh pr view "$NUMERO" -R "$GITHUB_REPOSITORY" --json title --jq .title; echo "$delim"; } >> "$GITHUB_OUTPUT"
       - id: atribuir
         name: Atribuir fallos
+        env:
+          MARCAS: ${{ steps.marcas.outputs.hay }}
+          TITULO_ACTUAL: ${{ steps.solicitud.outputs.titulo }}
         run: |
           # Un artefacto de otro commit (p. ej. de un intento anterior) no cuenta:
           # se descarta y la comparación lo trata como corrida sin resultado.
@@ -124,34 +152,18 @@ jobs:
           python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
           import json, sys
           sys.path.insert(0, "scripts/dotech")
-          from informe import estado_tests
-          estado, descripcion = estado_tests(json.load(open("comparacion.json", encoding="utf-8")), False, None)
+          from informe import alertas_del_entorno, estado_tests
+          comparacion = json.load(open("comparacion.json", encoding="utf-8"))
+          estado, descripcion = estado_tests(comparacion, False, None, alertas_del_entorno())
           print(f"estado={estado}")
           print(f"descripcion={descripcion}")
           PY
-      # Marcas de conflicto en archivos que ningún test toca no deben salir en verde.
-      # Se leen los objetos del commit con git grep; no se ejecuta nada de ese árbol.
-      - id: marcas
-        name: Buscar marcas de conflicto
-        run: |
-          git fetch --quiet --no-tags --depth=1 origin "$SHA"
-          if git grep -lE '^(<<<<<<<|>>>>>>>)( |$)' "$SHA" -- ; then
-            echo "::error::La rama de la solicitud tiene marcas de conflicto."
-            echo "hay=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "hay=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Publicar estados
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
           ESTADO: ${{ steps.atribuir.outputs.estado }}
           DESCRIPCION: ${{ steps.atribuir.outputs.descripcion }}
-          MARCAS: ${{ steps.marcas.outputs.hay }}
         run: |
-          if [ "$MARCAS" != "false" ]; then
-            ESTADO=failure
-            DESCRIPCION="La rama tiene marcas de conflicto (<<<<<<< / >>>>>>>) sin resolver"
-          fi
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
             -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
