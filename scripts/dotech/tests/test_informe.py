@@ -124,3 +124,21 @@ def test_entradas_de_archivos_incompletas():
     resumen = {"resuelto": True, "archivos": ["suelto", {"archivo": "a.py"}, {}]}
     texto = _cuerpo(conflicto=True, resumen_conflicto=resumen)
     assert "`a.py`" in texto
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/docling-project/docling/issues/12",
+    "HTTPS://GitHub.com/otro/repo/pull/3",
+    "github.com/docling-project/docling/pull/9",
+])
+def test_defusa_urls_de_github_en_texto_variable(url):
+    import re
+    lote = {"por_arreglo": {}, "areas": [{"sha": "ddd1234567", "titulo": f"fix: see {url} (#10)", "pr": 10}],
+            "workflows_nuevos": []}
+    comp = dict(CON_NUESTRAS, mensajes={"t::b": f"mira {url}"})
+    resumen = {"resuelto": True, "archivos": [
+        {"archivo": "a.py", "original": f"ver {url}", "decision": f"{url}", "tests": url}]}
+    texto = _cuerpo(lote=lote, comparacion=comp, explicacion=f"ver {url}", conflicto=True,
+                    resumen_conflicto=resumen, enlace="https://github.com/mi/fork/actions/runs/1")
+    assert len(re.findall(r"github\.com", texto, re.I)) == 1   # solo el enlace a la ejecución
+    assert "https://github.com/mi/fork/actions/runs/1" in texto

@@ -45,6 +45,7 @@ def estado_tests(comparacion: dict, conflicto: bool, resumen_conflicto: dict | N
 def _seguro(texto: str) -> str:
     """Neutraliza menciones, referencias `#N` y HTML en texto que no controlamos."""
     texto = str(texto).replace("@", "@\u200b").replace("<", "&lt;").replace(">", "&gt;")
+    texto = re.sub(r"(?i)github\.com", lambda m: m.group()[:6] + "\u200b" + m.group()[6:], texto)
     return re.sub(r"#(?=\d)", "#\u200b", texto)
 
 
