@@ -79,10 +79,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--salida", type=Path, required=True)
     a = ap.parse_args(argv)
     rango = f"{a.desde}..{a.hasta}"
-    cambios = parsear_log(_git("log", "--no-merges", f"--format={FORMATO_LOG}", "--name-only", rango))
+    cambios = parsear_log(_git("log", "--no-merges", "--no-renames", f"--format={FORMATO_LOG}", "--name-only", rango))
     grupos = relevantes(cambios, cargar(a.registro))
     nuevos = workflows_nuevos(
-        _git("diff", "--name-only", "--diff-filter=A", a.desde, a.hasta, "--", ".github/workflows/")
+        _git("diff", "--name-only", "--no-renames", "--diff-filter=A", a.desde, a.hasta, "--", ".github/workflows/")
     )
     datos = {
         "por_arreglo": {k: [_a_dict(c) for c in v] for k, v in grupos.items() if k != "_areas"},
