@@ -66,6 +66,7 @@ from docling.models.vlm_pipeline_models.hf_transformers_model import (
 )
 from docling.models.vlm_pipeline_models.mlx_model import HuggingFaceMlxModel
 from docling.pipeline.base_pipeline import PaginatedPipeline
+from docling.utils.vlm_response_quality import looks_degenerate
 from docling.utils.deepseekocr_utils import parse_deepseekocr_markdown
 from docling.utils.profiling import TimeRecorder
 
@@ -454,6 +455,20 @@ class VlmPipeline(PaginatedPipeline):
                         module_name=self.__class__.__name__,
                         error_message="VLM output incomplete "
                         f"(stop_reason={vlm_response.stop_reason.value}).",
+                        category=FailureCategory.INFERENCE_FAILURE,
+                        page_no=page.page_no,
+                    )
+                )
+                status = ConversionStatus.PARTIAL_SUCCESS
+            elif looks_degenerate(vlm_response.text):
+                # Generation can finish normally and still hand back nothing, or the
+                # same line hundreds of times. Neither is reported as an error, so
+                # without this a batch would deliver blank documents in silence.
+                conv_res.errors.append(
+                    ErrorItem(
+                        component_type=DoclingComponentType.PIPELINE,
+                        module_name=self.__class__.__name__,
+                        error_message="VLM output is empty or degenerate.",
                         category=FailureCategory.INFERENCE_FAILURE,
                         page_no=page.page_no,
                     )
