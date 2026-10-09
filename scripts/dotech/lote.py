@@ -13,7 +13,7 @@ from registro import Arreglo, cargar
 
 FORMATO_LOG = "%x1e%H%x1f%s"
 PALABRAS_AREA = ("layout", "reading-order", "reading order", "table", "vlm", "pdf")
-_TIPO_RELEVANTE = re.compile(r"^(feat|fix|perf)(\(|!|:)")
+_TIPO_RELEVANTE = re.compile(r"^(feat|fix|perf|refactor)(\(|!|:)")
 _PR = re.compile(r"\(#(\d+)\)\s*$")
 _PREFIJO_PROPIO = ".github/workflows/dotech-"
 

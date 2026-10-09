@@ -11,6 +11,7 @@ LOG = (
     "\x1eddd\x1ffix(pdf): keep failed-page sizes on the conversion (#4486)\n\n"
     "docling/pipeline/base_pipeline.py\n"
     "\x1eeee\x1fchore: bump pdf tooling\n\ndocling/x.py\n"
+    "\x1efff\x1frefactor(pdf): split the page backend (#4700)\n\ndocling/backend/pdf.py\n"
 )
 
 ARREGLOS = [
@@ -21,7 +22,7 @@ ARREGLOS = [
 
 def test_parsea_commits_con_archivos():
     cambios = parsear_log(LOG)
-    assert [c.sha for c in cambios] == ["aaa", "bbb", "ccc", "ddd", "eee"]
+    assert [c.sha for c in cambios] == ["aaa", "bbb", "ccc", "ddd", "eee", "fff"]
     assert cambios[0].archivos == ("docling/utils/layout_postprocessor.py", "docs/x.md")
     assert cambios[0].pr == 4276
     assert cambios[4].pr is None
@@ -31,8 +32,8 @@ def test_agrupa_por_arreglo_y_por_area():
     r = relevantes(parsear_log(LOG), ARREGLOS)
     assert [c.sha for c in r["bug2"]] == ["aaa"]
     assert [c.sha for c in r["bug45"]] == ["bbb"]
-    # ddd menciona pdf y es un fix; eee menciona pdf pero es chore; ccc no menciona áreas
-    assert [c.sha for c in r["_areas"]] == ["ddd"]
+    # ddd (fix) y fff (refactor) mencionan pdf; eee menciona pdf pero es chore; ccc no menciona áreas
+    assert [c.sha for c in r["_areas"]] == ["ddd", "fff"]
 
 
 def test_workflows_nuevos_ignora_los_propios():
