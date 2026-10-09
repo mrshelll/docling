@@ -181,3 +181,117 @@ def test_picture_children_keep_native_cell_order() -> None:
     processor._process_special_clusters()
 
     assert _child_texts(region) == [text for _, text, _, _ in _GRID]
+
+
+# --- Orden del documento final -------------------------------------------------
+#
+# Desde la reestructuración de los contenedores en el original, los hijos de un
+# KEY_VALUE_REGION solo deciden a qué contenedor pertenece cada elemento; el
+# orden dentro del contenedor lo vuelve a calcular el predictor de orden de
+# lectura basado en reglas, que en una rejilla etiqueta|valor lee por columnas.
+# Estos tests ejercitan ReadingOrderModel, la etapa que produce el documento.
+# FORM queda fuera a propósito: a veces envuelve una página entera de tablas y
+# listas, y ahí el orden por filas desordena el contenido.
+#
+# Las etiquetas terminan en ":" a propósito: así ninguna se fusiona con su valor
+# por la heurística de continuación de párrafo y el test mide solo el orden.
+
+from pathlib import PurePath  # noqa: E402
+
+from docling_core.types.doc import GroupLabel  # noqa: E402
+
+from docling.datamodel.base_models import (  # noqa: E402
+    AssembledUnit,
+    ContainerElement,
+    InputFormat,
+    Page,
+    TextElement,
+)
+from docling.datamodel.document import ConversionResult, InputDocument  # noqa: E402
+from docling.models.stages.reading_order.readingorder_model import (  # noqa: E402
+    ReadingOrderModel,
+    ReadingOrderOptions,
+)
+
+_KV_GRID = [
+    # (índice, texto,        left,  top)   columna por columna, como el generador
+    (0, "Rate:", 40.0, 100.4),
+    (1, "Term:", 40.0, 120.0),
+    (2, "14.45%", 150.0, 100.0),
+    (3, "090", 150.0, 120.0),
+    (4, "Currency:", 300.0, 100.0),
+    (5, "Installments:", 300.0, 120.0),
+    (6, "COP", 420.0, 100.0),
+    (7, "049", 420.0, 120.0),
+]
+
+EXPECTED_KV_ORDER = [
+    "Rate:",
+    "14.45%",
+    "Currency:",
+    "COP",
+    "Term:",
+    "090",
+    "Installments:",
+    "049",
+]
+
+
+def _key_value_area_from_grid(grid: list[tuple[int, str, float, float]]) -> list[str]:
+    """Convierte la rejilla con ReadingOrderModel y devuelve los textos del área."""
+    children = [
+        _child(cid=100 + index, cell=_text_cell(index, text, left, top))
+        for index, text, left, top in grid
+    ]
+    region_cluster = Cluster(
+        id=1,
+        label=DocItemLabel.KEY_VALUE_REGION,
+        bbox=BoundingBox(l=30.0, t=95.0, r=470.0, b=135.0),
+        confidence=0.7,
+        # Fila-mayor, que es como los deja el postprocesador de layout.
+        children=sorted(children, key=lambda c: (round(c.bbox.t / 10), c.id)),
+    )
+    region = ContainerElement(
+        label=DocItemLabel.KEY_VALUE_REGION, id=1, page_no=1, cluster=region_cluster
+    )
+    # El orden de ensamblado sigue el índice de celda nativo: columna-mayor.
+    texts = [
+        TextElement(
+            label=DocItemLabel.TEXT,
+            id=child.id,
+            text=child.cells[0].text,
+            page_no=1,
+            cluster=child,
+        )
+        for child in children
+    ]
+    elements = [region, *texts]
+    conv_res = ConversionResult(
+        input=InputDocument.model_construct(
+            file=PurePath("input.pdf"),
+            document_hash="0" * 64,
+            valid=True,
+            format=InputFormat.PDF,
+        ),
+        pages=[Page(page_no=1, size=Size(width=612.0, height=792.0))],
+        assembled=AssembledUnit(elements=elements, body=elements),
+    )
+
+    doc = ReadingOrderModel(ReadingOrderOptions())(conv_res)
+
+    area = next(
+        group for group in doc.groups if group.label == GroupLabel.KEY_VALUE_AREA
+    )
+    return [child.resolve(doc).text for child in area.children]
+
+
+def test_key_value_area_in_document_is_in_row_major_reading_order() -> None:
+    """El documento final debe alternar etiqueta y valor, fila a fila."""
+    assert _key_value_area_from_grid(_KV_GRID) == EXPECTED_KV_ORDER, (
+        "el área clave-valor del documento sale en orden columna-mayor, "
+        "así que cada etiqueta queda separada de su valor"
+    )
+
+
+def test_key_value_area_in_document_respects_right_to_left_documents() -> None:
+    assert _key_value_area_from_grid(_GRID_RTL) == EXPECTED_RTL_READING_ORDER

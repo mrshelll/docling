@@ -43,6 +43,7 @@ from docling.models.postprocessing.reading_order_rb import (
     SeparatorElement,
     build_page_separators,
 )
+from docling.utils.layout_postprocessor import LayoutPostprocessor
 from docling.utils.profiling import ProfilingScope, TimeRecorder
 
 
@@ -691,6 +692,40 @@ class ReadingOrderModel:
         if new_item.hyperlink != merged_elem.hyperlink:
             new_item.hyperlink = None
 
+    def _order_siblings(
+        self,
+        parent_ref: str | None,
+        siblings: list[ReadingOrderPageElement],
+        assembled_by_ref: dict[str, BasePageElement],
+        page_separators: list[SeparatorElement],
+    ) -> list[ReadingOrderPageElement]:
+        parent = assembled_by_ref[parent_ref] if parent_ref is not None else None
+        if parent is not None and parent.label == DocItemLabel.KEY_VALUE_REGION:
+            # A Key-Value-Region wraps a label/value grid, often emitted column
+            # by column. The rule-based predictor reads such a grid by columns,
+            # splitting every label from its value. Keep the row-major order the
+            # layout postprocessor gives the region's children; nested tables
+            # and pictures keep their own internal order. Form is left to the
+            # predictor: it sometimes wraps a whole page of tables and lists,
+            # where row-major order scrambles the content (measured with
+            # tests/data/pdf/sources/table_misidentified_as_form.pdf).
+            clusters = [assembled_by_ref[e.ref.cref].cluster for e in siblings]
+            rank = {
+                id(cluster): i
+                for i, cluster in enumerate(
+                    LayoutPostprocessor._sort_clusters_by_row(clusters)
+                )
+            }
+            return sorted(
+                siblings,
+                key=lambda e: rank[id(assembled_by_ref[e.ref.cref].cluster)],
+            )
+
+        return self.ro_model.predict_reading_order(
+            page_elements=siblings,
+            page_separators=page_separators if parent_ref is None else None,
+        )
+
     def __call__(self, conv_res: ConversionResult) -> DoclingDocument:
         with TimeRecorder(conv_res, "reading_order", scope=ProfilingScope.DOCUMENT):
             page_elements = self._assembled_to_readingorder_elements(conv_res)
@@ -743,11 +778,8 @@ class ReadingOrderModel:
 
             ordered_siblings = {
                 parent_ref: (
-                    self.ro_model.predict_reading_order(
-                        page_elements=siblings,
-                        page_separators=(
-                            page_separators if parent_ref is None else None
-                        ),
+                    self._order_siblings(
+                        parent_ref, siblings, assembled_by_ref, page_separators
                     )
                     if len(siblings) > 1
                     else siblings
