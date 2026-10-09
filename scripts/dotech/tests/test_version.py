@@ -48,3 +48,31 @@ def test_una_version_posterior_a_la_rechazada_si_se_propone():
 ])
 def test_tag_de_titulo(titulo, tag):
     assert tag_de_titulo(titulo) == tag
+
+
+def test_tag_anterior_se_mide_desde_main_aunque_la_base_sea_la_rama(monkeypatch, capsys):
+    import subprocess
+
+    import version
+
+    pedidos = []
+
+    def salida(*args):
+        pedidos.append(args)
+        if args[:3] == ("gh", "pr", "list") and "open" in args:
+            return '[{"number": 1}]'
+        if args[:3] == ("gh", "pr", "list"):
+            return "[]"
+        return "v2.135.0"
+
+    monkeypatch.setattr(version, "_salida", salida)
+    monkeypatch.setattr(
+        version, "_ejecutar",
+        lambda *a: subprocess.CompletedProcess(a, 0 if a[:2] == ("git", "ls-remote") else 1, "", ""),
+    )
+    version.main(["--repo", "r", "--upstream", "u", "--rama", RAMA, "--ref", "v2.136.0"])
+
+    salida_cli = capsys.readouterr().out
+    assert "base=" + RAMA in salida_cli
+    describe = [p for p in pedidos if p[:2] == ("git", "describe")]
+    assert describe and describe[0][-1] == "origin/main"
