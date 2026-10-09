@@ -1,0 +1,137 @@
+# Abre una solicitud a main con la cuenta de servicio y le pasa los tests.
+# Con la regla de dos aprobaciones, una solicitud abierta por Miguel solo podría
+# aprobarla Fabio; abierta por la cuenta de servicio, la aprueban los dos.
+name: dotech-abrir-solicitud
+
+on:
+  workflow_dispatch:
+    inputs:
+      rama:
+        description: "Rama a integrar en main"
+        required: true
+      titulo:
+        description: "Título de la solicitud"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  abrir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.datos.outputs.sha }}
+      main: ${{ steps.datos.outputs.main }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+      # Si la solicitud ya existe (otra ejecución sobre la misma rama), se reutiliza
+      # y solo se vuelven a pasar los tests.
+      - id: datos
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RAMA: ${{ inputs.rama }}
+          TITULO: ${{ inputs.titulo }}
+        run: |
+          numero=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$RAMA" --base main --state open \
+            --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')
+          if [ -z "$numero" ]; then
+            url=$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$RAMA" --title "$TITULO" \
+              --body "Abierta por la cuenta de servicio para que la aprueben Miguel y Fabio. Antes de aprobar: \`docling-validar <número>\` en el Mac de Miguel." \
+              --reviewer mrshelll,alejojau)
+            numero="${url##*/}"
+          else
+            echo "::notice::La solicitud #$numero ya estaba abierta: se vuelven a pasar los tests."
+          fi
+          sha=$(gh pr view "$numero" -R "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "main=$main" >> "$GITHUB_OUTPUT"
+
+  tests-original:
+    needs: abrir
+    uses: ./.github/workflows/dotech-pruebas.yml
+    with:
+      lado: original
+      repositorio: ${{ github.repository }}
+      ref: ${{ needs.abrir.outputs.main }}
+      sha_nuestra: ${{ needs.abrir.outputs.sha }}
+
+  tests-nuestra:
+    needs: abrir
+    uses: ./.github/workflows/dotech-pruebas.yml
+    with:
+      lado: nuestra
+      repositorio: ${{ github.repository }}
+      ref: ${{ needs.abrir.outputs.sha }}
+      sha_nuestra: ${{ needs.abrir.outputs.sha }}
+
+  estado:
+    needs: [abrir, tests-original, tests-nuestra]
+    if: always() && needs.abrir.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SHA: ${{ needs.abrir.outputs.sha }}
+      MAIN: ${{ needs.abrir.outputs.main }}
+      ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.abrir.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tests-*
+          path: artefactos
+      - id: atribuir
+        name: Atribuir fallos
+        run: |
+          # Un artefacto de otro commit (p. ej. de un intento anterior) no cuenta:
+          # se descarta y la comparación lo trata como corrida sin resultado.
+          descartar_si_ajeno() {
+            if [ "$(cat "$1/ref.txt" 2>/dev/null)" != "$2" ]; then
+              echo "::warning::$1 no corresponde a $2; se descarta."
+              rm -rf "$1"
+            fi
+          }
+          descartar_si_ajeno artefactos/tests-original "$MAIN"
+          descartar_si_ajeno artefactos/tests-nuestra "$SHA"
+          mkdir -p artefactos/tests-original artefactos/tests-nuestra
+          python3 scripts/dotech/comparar_junit.py --original artefactos/tests-original \
+            --nuestra artefactos/tests-nuestra --salida comparacion.json
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          sys.path.insert(0, "scripts/dotech")
+          from informe import estado_tests
+          estado, descripcion = estado_tests(json.load(open("comparacion.json", encoding="utf-8")), False, None)
+          print(f"estado={estado}")
+          print(f"descripcion={descripcion}")
+          PY
+      - name: Publicar estados
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ESTADO: ${{ steps.atribuir.outputs.estado }}
+          DESCRIPCION: ${{ steps.atribuir.outputs.descripcion }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
+            -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
+            -f context=dotech/validacion-local -f description="Falta docling-validar en el Mac de Miguel"
+      - name: Marcar el fallo en el commit
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=failure \
+            -f context=dotech/tests -f description="No se pudieron atribuir los fallos de los tests" \
+            -f target_url="$ENLACE"
