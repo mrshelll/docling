@@ -18,20 +18,24 @@ from pathlib import Path
 
 from registro import Arreglo, cargar
 
+TIMEOUT_PYTEST_S = 20 * 60
+
 
 def _es_asercion(mensaje: str) -> bool:
     return mensaje.startswith("assert ") or mensaje.startswith("AssertionError")
 
 
 def veredicto(codigo_salida: int, junit: Path | None) -> str:
-    if codigo_salida == 0:
-        return "sobra"
-    if codigo_salida != 1 or junit is None or not junit.exists():
+    if codigo_salida not in (0, 1) or junit is None or not junit.exists():
         return "no_concluyente"
     try:
         casos = list(ET.parse(junit).getroot().iter("testcase"))
     except ET.ParseError:
         return "no_concluyente"
+    if codigo_salida == 0:
+        # pytest también sale 0 si todo se salta: hace falta al menos un test que corra.
+        corrio = any(caso.find("skipped") is None for caso in casos)
+        return "sobra" if corrio else "no_concluyente"
     fallos = [h for caso in casos for h in caso if h.tag in ("failure", "error")]
     if fallos and all(h.tag == "failure" and _es_asercion(h.get("message") or "") for h in fallos):
         return "hace_falta"
@@ -66,11 +70,14 @@ def evaluar(arreglo: Arreglo, fuente: Path, original: Path) -> dict[str, str]:
     except (OSError, subprocess.CalledProcessError) as exc:
         return {"veredicto": "no_concluyente", "detalle": f"no se pudo copiar el test: {exc}"}
     junit = original / f"junit-sobra-{arreglo.clave}.xml"
-    r = subprocess.run(
-        ["uv", "run", "--no-sync", "pytest", "-q", "-p", "no:cacheprovider",
-         f"--junitxml={junit}", arreglo.test_comportamiento],
-        cwd=original, capture_output=True, text=True,
-    )
+    try:
+        r = subprocess.run(
+            ["uv", "run", "--no-sync", "pytest", "-q", "-p", "no:cacheprovider",
+             f"--junitxml={junit}", arreglo.test_comportamiento],
+            cwd=original, capture_output=True, text=True, timeout=TIMEOUT_PYTEST_S,
+        )
+    except subprocess.TimeoutExpired:
+        return {"veredicto": "no_concluyente", "detalle": f"timeout tras {TIMEOUT_PYTEST_S // 60} min"}
     return {"veredicto": veredicto(r.returncode, junit), "detalle": r.stdout.strip()[-300:]}
 
 
@@ -81,7 +88,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--original", type=Path, required=True)
     ap.add_argument("--salida", type=Path, required=True)
     a = ap.parse_args(argv)
-    resultado = {x.clave: evaluar(x, a.fuente, a.original) for x in cargar(a.registro)}
+    resultado = {}
+    for x in cargar(a.registro):
+        try:
+            resultado[x.clave] = evaluar(x, a.fuente, a.original)
+        except Exception as exc:  # un arreglo roto no debe dejar sin informe a los demás
+            resultado[x.clave] = {"veredicto": "no_concluyente",
+                                  "detalle": f"{type(exc).__name__}: {exc}"}
     a.salida.write_text(json.dumps(resultado, ensure_ascii=False, indent=2), encoding="utf-8")
     return 0
 
