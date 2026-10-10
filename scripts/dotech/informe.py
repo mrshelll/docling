@@ -13,14 +13,12 @@ from registro import Arreglo, cargar
 
 # Nada se enlaza ni menciona al original: GitHub crearía referencias cruzadas y avisos allí.
 REF_PR = "`docling-project/docling#{}`"
+MARCA = "[conflicto para revisar a mano]"
 VEREDICTOS = {
     "sobra": "Sobra: el original ya lo resuelve. Proponer retirarlo.",
     "hace_falta": "Sigue haciendo falta.",
     "no_concluyente": "No concluyente: su test no pudo correr sobre el original. Revisar a mano.",
 }
-
-
-MARCA = "[conflicto para revisar a mano]"
 
 
 @dataclass(frozen=True)
@@ -221,7 +219,18 @@ def _json(ruta: Path) -> dict:
 
 
 def _rutas(variable: str) -> tuple[str, ...]:
-    return tuple(r.strip() for r in os.environ.get(variable, "").splitlines() if r.strip())
+    rutas = (r.strip() for r in os.environ.get(variable, "").splitlines())
+    return tuple(r for r in rutas if r)
+
+
+def resumen_del_entorno() -> dict | None:
+    """RESUMEN_CONFLICTO: JSON con el resumen de Claude. Ausente, roto o no-objeto → None."""
+    crudo = os.environ.get("RESUMEN_CONFLICTO", "").strip()
+    try:
+        resumen = json.loads(crudo) if crudo else None
+    except ValueError:
+        return None
+    return resumen if isinstance(resumen, dict) else None
 
 
 def alertas_del_entorno() -> Alertas:
@@ -245,13 +254,7 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     conflicto = os.environ.get("CONFLICTO", "false") == "true"
-    crudo = os.environ.get("RESUMEN_CONFLICTO", "").strip()
-    try:
-        resumen = json.loads(crudo) if crudo else None
-    except ValueError:
-        resumen = None
-    if not isinstance(resumen, dict):
-        resumen = None
+    resumen = resumen_del_entorno()
     alertas = alertas_del_entorno()
     comparacion = _json(a.comparacion)
     sobra = _json(a.sobra) if a.sobra.exists() else {}

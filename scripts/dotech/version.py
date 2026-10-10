@@ -14,6 +14,8 @@ import sys
 from dataclasses import dataclass
 
 _TITULO = re.compile(r"Pasar a (v\d+\.\d+\.\d+\S*)")
+_CAMPOS_ORIGEN = "isCrossRepository,headRepositoryOwner"
+_LIMITE_CERRADAS = 20
 
 
 @dataclass(frozen=True)
@@ -27,10 +29,6 @@ class Decision:
 def tag_de_titulo(titulo: str) -> str | None:
     m = _TITULO.search(titulo)
     return m.group(1) if m else None
-
-
-_CAMPOS_ORIGEN = "isCrossRepository,headRepositoryOwner"
-_LIMITE_CERRADAS = 20
 
 
 def solicitudes_propias(solicitudes: list[dict], dueno: str) -> list[dict]:

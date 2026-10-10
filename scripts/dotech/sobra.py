@@ -22,7 +22,7 @@ TIMEOUT_PYTEST_S = 20 * 60
 
 
 def _es_asercion(mensaje: str) -> bool:
-    return mensaje.startswith("assert ") or mensaje.startswith("AssertionError")
+    return mensaje.startswith(("assert ", "AssertionError"))
 
 
 def veredicto(codigo_salida: int, junit: Path | None) -> str:

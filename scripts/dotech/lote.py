@@ -57,10 +57,8 @@ def relevantes(cambios: list[Cambio], arreglos: list[Arreglo]) -> dict[str, list
 
 
 def workflows_nuevos(nombres: str) -> list[str]:
-    return [
-        n.strip() for n in nombres.splitlines()
-        if n.strip() and not n.strip().startswith(_PREFIJO_PROPIO)
-    ]
+    rutas = (n.strip() for n in nombres.splitlines())
+    return [r for r in rutas if r and not r.startswith(_PREFIJO_PROPIO)]
 
 
 def _git(*args: str) -> str:
@@ -79,11 +77,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--salida", type=Path, required=True)
     a = ap.parse_args(argv)
     rango = f"{a.desde}..{a.hasta}"
-    cambios = parsear_log(_git("log", "--no-merges", "--no-renames", f"--format={FORMATO_LOG}", "--name-only", rango))
+    cambios = parsear_log(_git(
+        "log", "--no-merges", "--no-renames", f"--format={FORMATO_LOG}", "--name-only", rango,
+    ))
     grupos = relevantes(cambios, cargar(a.registro))
-    nuevos = workflows_nuevos(
-        _git("diff", "--name-only", "--no-renames", "--diff-filter=A", a.desde, a.hasta, "--", ".github/workflows/")
-    )
+    nuevos = workflows_nuevos(_git(
+        "diff", "--name-only", "--no-renames", "--diff-filter=A", a.desde, a.hasta,
+        "--", ".github/workflows/",
+    ))
     datos = {
         "por_arreglo": {k: [_a_dict(c) for c in v] for k, v in grupos.items() if k != "_areas"},
         "areas": [_a_dict(c) for c in grupos["_areas"]],
