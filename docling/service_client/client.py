@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Synchronous client SDK for docling-serve."""
 
 from __future__ import annotations
@@ -14,7 +17,7 @@ import tempfile
 import time
 import warnings
 import zipfile
-from collections.abc import AsyncGenerator, Iterable, Iterator
+from collections.abc import AsyncGenerator, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -26,6 +29,7 @@ from urllib.parse import urlencode, urlparse
 
 import httpx
 from docling_core.types.doc import DoclingDocument, ImageRef, PictureItem
+from docling_core.types.doc.common.constants import CURRENT_VERSION
 from docling_core.types.io import DocumentStream
 from PIL import Image as PILImage
 from pydantic import AnyHttpUrl, SecretBytes, SecretStr, TypeAdapter, ValidationError
@@ -51,8 +55,11 @@ from docling.datamodel.service.options import (
 )
 from docling.datamodel.service.requests import (
     BatchConvertSourcesRequest,
-    BatchSourceRequestItem,
+    BatchSourceRequestInput,
+    BatchTargetRequest,
+    BatchTargetRequestInput,
     ConvertDocumentsRequest,
+    GenericTargetRequest,
     HttpSourceRequest,
 )
 from docling.datamodel.service.responses import (
@@ -108,7 +115,7 @@ StorageTarget: TypeAlias = (
     S3Target | AzureBlobTarget | GoogleCloudStorageTarget | GoogleDriveTarget
 )
 SubmitTarget: TypeAlias = InBodyTarget | ZipTarget | PresignedUrlTarget | StorageTarget
-BatchSubmitTarget: TypeAlias = StorageTarget | PresignedUrlTarget
+BatchSubmitTarget: TypeAlias = BatchTargetRequestInput
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
@@ -131,6 +138,7 @@ _STORAGE_TARGET_TYPES = (
     AzureBlobTarget,
     GoogleCloudStorageTarget,
     GoogleDriveTarget,
+    GenericTargetRequest,
 )
 
 
@@ -285,7 +293,7 @@ class _BaseDoclingServiceClient:
     ) -> dict[str, Any]:
         return options.model_dump(
             mode="json",
-            exclude_defaults=True,
+            exclude_unset=True,
             exclude_none=True,
         )
 
@@ -373,7 +381,7 @@ class _BaseDoclingServiceClient:
         self,
         options: ConvertDocumentsRequestOptions,
         output_formats: list[OutputFormat] | None,
-        target: SubmitTarget,
+        target: SubmitTarget | GenericTargetRequest,
     ) -> ConvertDocumentsRequestOptions:
         effective = options
         if output_formats is not None:
@@ -649,7 +657,13 @@ class _BaseDoclingServiceClient:
         except (TypeError, ValueError, IndexError, OverflowError):
             return None
 
-        now = datetime.now(tz=retry_at.tzinfo or timezone.utc)
+        # parsedate_to_datetime returns a naive datetime for HTTP-dates carrying
+        # an unknown timezone (e.g. "-0000"); assume UTC so the subtraction below
+        # does not mix naive and aware datetimes.
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(tz=timezone.utc)
         return max(0.0, (retry_at - now).total_seconds())
 
     def _raise_for_result_404(
@@ -837,7 +851,11 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
             write=http_read_timeout,
             pool=http_read_timeout,
         )
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = {
+            # Tell the server the newest DoclingDocument version this client's
+            # installed docling-core can read; the server down-projects if needed.
+            "Accept-Docling-Document-Version": CURRENT_VERSION,
+        }
         if api_key:
             headers["X-Api-Key"] = api_key
         self._http_client = httpx.Client(timeout=timeout, headers=headers)
@@ -1052,30 +1070,47 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
 
     def submit_batch(
         self,
-        sources: list[BatchSourceRequestItem],
-        target: BatchSubmitTarget,
+        sources: Sequence[BatchSourceRequestInput],
+        target: BatchTargetRequestInput | None = None,
         output_formats: list[OutputFormat] | None = None,
         options: ConvertDocumentsRequestOptions | None = None,
         headers: dict[str, str] | None = None,
+        *,
+        targets: list[BatchTargetRequestInput] | None = None,
     ) -> (
         ConversionJob[PresignedUrlConvertDocumentResponse]
         | ConversionJob[PresignedUrlConvertResponse]
     ):
+        if target is None and targets is None:
+            raise ValueError("submit_batch() requires either 'target' or 'targets'.")
+        if target is not None and targets is not None:
+            raise ValueError(
+                "submit_batch() received both 'target' and 'targets'; supply only one."
+            )
+        payload: dict[str, Any] = {"sources": sources}
+        if targets is not None:
+            payload["targets"] = targets
+        else:
+            payload["target"] = target
+        request = BatchConvertSourcesRequest.model_validate(payload)
         resolved = self._resolve_options(
             options=options,
             max_num_pages=None,
             max_file_size=None,
             page_range=None,
         )
+        # Use the first effective target for output-format hint.
+        first_target = (request.targets or [request.target])[0]
         submit_options = self._options_for_output_formats(
             resolved.options,
             output_formats=output_formats,
-            target=target,
+            target=first_target,
         )
         return self._submit_batch_conversion_job(
-            sources=sources,
+            sources=request.sources,
             options=submit_options,
-            target=target,
+            target=request.target,
+            targets=request.targets,
             request_headers=headers,
         )
 
@@ -1415,9 +1450,10 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
 
     def _submit_batch_conversion_job(
         self,
-        sources: list[BatchSourceRequestItem],
+        sources: Sequence[BatchSourceRequestInput],
         options: ConvertDocumentsRequestOptions,
-        target: BatchSubmitTarget,
+        target: BatchSubmitTarget | None,
+        targets: list[BatchTargetRequest] | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> (
         ConversionJob[PresignedUrlConvertDocumentResponse]
@@ -1427,9 +1463,13 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
             sources=sources,
             options=options,
             target=target,
+            targets=targets,
             request_headers=request_headers,
         )
-        if _is_storage_target(target):
+        all_targets = (
+            targets if targets is not None else ([target] if target is not None else [])
+        )
+        if any(_is_storage_target(t) for t in all_targets):
 
             def fetch_result(
                 task_id: str,
@@ -1465,16 +1505,18 @@ class DoclingServiceClient(_BaseDoclingServiceClient):
 
     def _submit_batch_task(
         self,
-        sources: list[BatchSourceRequestItem],
+        sources: Sequence[BatchSourceRequestInput],
         options: ConvertDocumentsRequestOptions,
-        target: BatchSubmitTarget,
+        target: BatchSubmitTarget | None,
+        targets: list[BatchTargetRequest] | None = None,
         request_headers: dict[str, str] | None = None,
     ) -> TaskStatusResponse:
-        request = BatchConvertSourcesRequest(
-            options=options,
-            sources=sources,
-            target=target,
-        )
+        payload: dict[str, Any] = {"options": options, "sources": sources}
+        if targets is not None:
+            payload["targets"] = targets
+        else:
+            payload["target"] = target
+        request = BatchConvertSourcesRequest.model_validate(payload)
         response = self._request_with_retry(
             method="POST",
             path="/v1/convert/source/batch",

@@ -3,7 +3,7 @@
   "version": "1.10.0",
   "name": "powerpoint_sample",
   "origin": {
-    "mimetype": "application/vnd.ms-powerpoint",
+    "mimetype": "application/vnd.openxmlformats-officedocument.presentationml.template",
     "binary_hash": 15572290240354948364,
     "filename": "powerpoint_sample.pptx"
   },
@@ -42,10 +42,10 @@
           "$ref": "#/texts/0"
         },
         {
-          "$ref": "#/texts/1"
+          "$ref": "#/tables/0"
         },
         {
-          "$ref": "#/tables/0"
+          "$ref": "#/texts/1"
         }
       ],
       "content_layer": "body",
@@ -65,10 +65,10 @@
           "$ref": "#/texts/3"
         },
         {
-          "$ref": "#/groups/2"
+          "$ref": "#/texts/4"
         },
         {
-          "$ref": "#/texts/7"
+          "$ref": "#/groups/2"
         },
         {
           "$ref": "#/texts/8"
@@ -85,13 +85,13 @@
       },
       "children": [
         {
-          "$ref": "#/texts/4"
-        },
-        {
           "$ref": "#/texts/5"
         },
         {
           "$ref": "#/texts/6"
+        },
+        {
+          "$ref": "#/texts/7"
         }
       ],
       "content_layer": "body",
@@ -248,10 +248,10 @@
           "page_no": 1,
           "bbox": {
             "l": 1524000.0,
-            "t": 1576935.0,
+            "t": 644526.0,
             "r": 10668000.0,
-            "b": 644526.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 1576935.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
@@ -275,10 +275,10 @@
           "page_no": 1,
           "bbox": {
             "l": 1524000.0,
-            "t": 5888420.0,
+            "t": 5433848.0,
             "r": 10668000.0,
-            "b": 5433848.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 5888420.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
@@ -302,10 +302,10 @@
           "page_no": 2,
           "bbox": {
             "l": 838200.0,
-            "t": 1690688.0,
+            "t": 365125.0,
             "r": 11353800.0,
-            "b": 365125.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 1690688.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
@@ -328,49 +328,47 @@
         {
           "page_no": 2,
           "bbox": {
-            "l": 838200.0,
-            "t": 3962400.0,
-            "r": 4461831.0,
-            "b": 1825625.0,
-            "coord_origin": "BOTTOMLEFT"
+            "l": 6180463.0,
+            "t": 1344058.0,
+            "r": 10256704.0,
+            "b": 5221995.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            50
+            40
           ]
         }
       ],
-      "orig": "Let’s introduce a list",
-      "text": "Let’s introduce a list"
+      "orig": "A rectangle shape with this text inside.",
+      "text": "A rectangle shape with this text inside."
     },
     {
       "self_ref": "#/texts/4",
       "parent": {
-        "$ref": "#/groups/2"
+        "$ref": "#/groups/1"
       },
       "children": [],
       "content_layer": "body",
-      "label": "list_item",
+      "label": "paragraph",
       "prov": [
         {
           "page_no": 2,
           "bbox": {
             "l": 838200.0,
-            "t": 3962400.0,
+            "t": 1825625.0,
             "r": 4461831.0,
-            "b": 1825625.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3962400.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            50
+            22
           ]
         }
       ],
-      "orig": "With foo",
-      "text": "With foo",
-      "enumerated": false,
-      "marker": ""
+      "orig": "Let’s introduce a list",
+      "text": "Let’s introduce a list"
     },
     {
       "self_ref": "#/texts/5",
@@ -385,19 +383,19 @@
           "page_no": 2,
           "bbox": {
             "l": 838200.0,
-            "t": 3962400.0,
+            "t": 1825625.0,
             "r": 4461831.0,
-            "b": 1825625.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3962400.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            50
+            8
           ]
         }
       ],
-      "orig": "Bar",
-      "text": "Bar",
+      "orig": "With foo",
+      "text": "With foo",
       "enumerated": false,
       "marker": ""
     },
@@ -414,14 +412,43 @@
           "page_no": 2,
           "bbox": {
             "l": 838200.0,
-            "t": 3962400.0,
+            "t": 1825625.0,
             "r": 4461831.0,
-            "b": 1825625.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3962400.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            50
+            3
+          ]
+        }
+      ],
+      "orig": "Bar",
+      "text": "Bar",
+      "enumerated": false,
+      "marker": ""
+    },
+    {
+      "self_ref": "#/texts/7",
+      "parent": {
+        "$ref": "#/groups/2"
+      },
+      "children": [],
+      "content_layer": "body",
+      "label": "list_item",
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": {
+            "l": 838200.0,
+            "t": 1825625.0,
+            "r": 4461831.0,
+            "b": 3962400.0,
+            "coord_origin": "TOPLEFT"
+          },
+          "charspan": [
+            0,
+            14
           ]
         }
       ],
@@ -429,33 +456,6 @@
       "text": "And baz things",
       "enumerated": false,
       "marker": ""
-    },
-    {
-      "self_ref": "#/texts/7",
-      "parent": {
-        "$ref": "#/groups/1"
-      },
-      "children": [],
-      "content_layer": "body",
-      "label": "paragraph",
-      "prov": [
-        {
-          "page_no": 2,
-          "bbox": {
-            "l": 6180463.0,
-            "t": 5221995.0,
-            "r": 10256704.0,
-            "b": 1344058.0,
-            "coord_origin": "BOTTOMLEFT"
-          },
-          "charspan": [
-            0,
-            40
-          ]
-        }
-      ],
-      "orig": "A rectangle shape with this text inside.",
-      "text": "A rectangle shape with this text inside."
     },
     {
       "self_ref": "#/texts/8",
@@ -497,14 +497,14 @@
           "page_no": 3,
           "bbox": {
             "l": 2423634.0,
-            "t": 3357995.0,
+            "t": 2434665.0,
             "r": 3928277.0,
-            "b": 2434665.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3357995.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            32
+            10
           ]
         }
       ],
@@ -526,14 +526,14 @@
           "page_no": 3,
           "bbox": {
             "l": 2423634.0,
-            "t": 3357995.0,
+            "t": 2434665.0,
             "r": 3928277.0,
-            "b": 2434665.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3357995.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            32
+            10
           ]
         }
       ],
@@ -555,14 +555,14 @@
           "page_no": 3,
           "bbox": {
             "l": 2423634.0,
-            "t": 3357995.0,
+            "t": 2434665.0,
             "r": 3928277.0,
-            "b": 2434665.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3357995.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            32
+            10
           ]
         }
       ],
@@ -584,14 +584,14 @@
           "page_no": 3,
           "bbox": {
             "l": 4453634.0,
-            "t": 3657882.0,
+            "t": 2457553.0,
             "r": 5109583.0,
-            "b": 2457553.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3657882.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            11
+            2
           ]
         }
       ],
@@ -613,14 +613,14 @@
           "page_no": 3,
           "bbox": {
             "l": 4453634.0,
-            "t": 3657882.0,
+            "t": 2457553.0,
             "r": 5109583.0,
-            "b": 2457553.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3657882.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            11
+            2
           ]
         }
       ],
@@ -642,14 +642,14 @@
           "page_no": 3,
           "bbox": {
             "l": 4453634.0,
-            "t": 3657882.0,
+            "t": 2457553.0,
             "r": 5109583.0,
-            "b": 2457553.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3657882.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            11
+            2
           ]
         }
       ],
@@ -671,14 +671,14 @@
           "page_no": 3,
           "bbox": {
             "l": 4453634.0,
-            "t": 3657882.0,
+            "t": 2457553.0,
             "r": 5109583.0,
-            "b": 2457553.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3657882.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            11
+            2
           ]
         }
       ],
@@ -700,14 +700,14 @@
           "page_no": 3,
           "bbox": {
             "l": 5634940.0,
-            "t": 3380884.0,
+            "t": 2457554.0,
             "r": 6881050.0,
-            "b": 2457554.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3380884.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            24
+            10
           ]
         }
       ],
@@ -727,14 +727,14 @@
           "page_no": 3,
           "bbox": {
             "l": 5634940.0,
-            "t": 3380884.0,
+            "t": 2457554.0,
             "r": 6881050.0,
-            "b": 2457554.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3380884.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            24
+            6
           ]
         }
       ],
@@ -756,14 +756,14 @@
           "page_no": 3,
           "bbox": {
             "l": 5634940.0,
-            "t": 3380884.0,
+            "t": 2457554.0,
             "r": 6881050.0,
-            "b": 2457554.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3380884.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            24
+            6
           ]
         }
       ],
@@ -785,14 +785,14 @@
           "page_no": 3,
           "bbox": {
             "l": 7531336.0,
-            "t": 3659750.0,
+            "t": 2459421.0,
             "r": 9009626.0,
-            "b": 2459421.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3659750.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            31
+            13
           ]
         }
       ],
@@ -812,14 +812,14 @@
           "page_no": 3,
           "bbox": {
             "l": 7531336.0,
-            "t": 3659750.0,
+            "t": 2459421.0,
             "r": 9009626.0,
-            "b": 2459421.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3659750.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            31
+            5
           ]
         }
       ],
@@ -841,14 +841,14 @@
           "page_no": 3,
           "bbox": {
             "l": 7531336.0,
-            "t": 3659750.0,
+            "t": 2459421.0,
             "r": 9009626.0,
-            "b": 2459421.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3659750.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            31
+            5
           ]
         }
       ],
@@ -870,14 +870,14 @@
           "page_no": 3,
           "bbox": {
             "l": 7531336.0,
-            "t": 3659750.0,
+            "t": 2459421.0,
             "r": 9009626.0,
-            "b": 2459421.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3659750.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            31
+            5
           ]
         }
       ],
@@ -899,14 +899,14 @@
           "page_no": 3,
           "bbox": {
             "l": 9404392.0,
-            "t": 3357995.0,
+            "t": 2434665.0,
             "r": 10060341.0,
-            "b": 2434665.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3357995.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            9
+            3
           ]
         }
       ],
@@ -928,14 +928,14 @@
           "page_no": 3,
           "bbox": {
             "l": 9404392.0,
-            "t": 3357995.0,
+            "t": 2434665.0,
             "r": 10060341.0,
-            "b": 2434665.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3357995.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            9
+            2
           ]
         }
       ],
@@ -957,14 +957,14 @@
           "page_no": 3,
           "bbox": {
             "l": 9404392.0,
-            "t": 3357995.0,
+            "t": 2434665.0,
             "r": 10060341.0,
-            "b": 2434665.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 3357995.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,
-            9
+            2
           ]
         }
       ],
@@ -1016,10 +1016,10 @@
           "page_no": 1,
           "bbox": {
             "l": 2031999.0,
-            "t": 5283200.0,
+            "t": 1945640.0,
             "r": 10160000.0,
-            "b": 1945640.0,
-            "coord_origin": "BOTTOMLEFT"
+            "b": 5283200.0,
+            "coord_origin": "TOPLEFT"
           },
           "charspan": [
             0,

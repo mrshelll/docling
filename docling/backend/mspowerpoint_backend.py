@@ -1,12 +1,16 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 from __future__ import annotations
 
 import logging
 import shutil
 import warnings
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Any, Callable, Final, Optional, Union
+from typing import Any, Callable, Final, Iterable, Iterator, Literal, Optional, Union
 
 from docling_core.types.doc import (
     BoundingBox,
@@ -14,8 +18,11 @@ from docling_core.types.doc import (
     DocItemLabel,
     DoclingDocument,
     DocumentOrigin,
+    GroupItem,
     GroupLabel,
     ImageRef,
+    ListGroup,
+    ListItem,
     PictureClassificationLabel,
     PictureClassificationMetaField,
     PictureClassificationPrediction,
@@ -35,7 +42,13 @@ from docling.backend.abstract_backend import (
     DeclarativeDocumentBackend,
     PaginatedDocumentBackend,
 )
-from docling.backend.docx.drawingml.utils import convert_to_modern_format
+from docling.backend.docx.drawingml.utils import (
+    convert_to_modern_format,
+    crop_whitespace,
+    get_docx_to_pdf_converter,
+)
+from docling.backend.docx.latex.omml import oMath2Latex
+from docling.backend.utils.image import normalize_image_for_png
 from docling.datamodel.backend_options import MsPowerpointBackendOptions
 from docling.datamodel.base_models import FormatToMimeType, InputFormat
 from docling.datamodel.document import InputDocument
@@ -49,26 +62,23 @@ try:  # pragma: no cover - import-time guard
     from pptx import Presentation, presentation
     from pptx.enum.shapes import MSO_SHAPE_TYPE, PP_PLACEHOLDER
     from pptx.exc import InvalidXmlError
+    from pptx.oxml.ns import qn
     from pptx.oxml.text import CT_TextLineBreak
+    from pptx.shapes.autoshape import Shape
+    from pptx.shapes.base import BaseShape
+    from pptx.shapes.picture import Picture
 
     _PPTX_AVAILABLE = True
 except ImportError as e:  # pragma: no cover - import-time guard
     _PPTX_IMPORT_ERROR = e
 
-# Chart image rendering is opt-in and relies on pypdfium2 plus the shared
-# DrawingML/LibreOffice helpers, which live behind the PDF extra rather than
-# format-pptx. Guard them separately so a slim PPTX install still parses text,
-# tables, and chart data; only render_chart_images needs these.
-_CHART_RENDER_AVAILABLE: bool = False
+# pypdfium2 ships with the PDF extras, not with format-pptx, and is only reached
+# after `get_docx_to_pdf_converter` returns a converter. That shared factory
+# returns None when pypdfium2 is missing, so the rendering paths already degrade
+# to "no image"; this guard only keeps the module itself importable.
+# See https://github.com/docling-project/docling/issues/3613.
 try:  # pragma: no cover - import-time guard
     import pypdfium2
-
-    from docling.backend.docx.drawingml.utils import (
-        crop_whitespace,
-        get_docx_to_pdf_converter,
-    )
-
-    _CHART_RENDER_AVAILABLE = True
 except ImportError:  # pragma: no cover - import-time guard
     pass
 
@@ -84,6 +94,94 @@ _CHART_RENDER_HINT = (
     "data without it."
 )
 
+_IMAGE_RENDER_HINT = (
+    "LibreOffice is required to rasterize EMF/WMF pictures embedded in slides. "
+    "Install LibreOffice and make sure `soffice` is on PATH. Such pictures are "
+    "still recorded with their position on the slide without it, but carry no "
+    "image data."
+)
+
+_MAX_CHART_TABLE_CELLS: Final = 100_000
+"""Backstop on the total cells emitted for one chart's reconstructed data table.
+
+Charts whose declared category range far exceeds their plotted data are trimmed
+to populated rows first; this cap only binds genuinely huge charts. 100k cells
+still admit e.g. a 10k-point, 5-series chart while keeping any single chart's
+markdown output to a few megabytes.
+"""
+
+# Windows metafile signatures. A placeable WMF opens with the Aldus magic and an
+# EMF carries " EMF" in the dSignature field of its EMR_HEADER, 40 bytes in.
+# These are the two Pillow itself identifies, so a bare WMF never reaches here.
+_WMF_PLACEABLE_MAGIC: Final = b"\xd7\xcd\xc6\x9a"
+_EMF_SIGNATURE: Final = b" EMF"
+_EMF_SIGNATURE_OFFSET: Final = 40
+
+
+# The markup-compatibility namespace. python-pptx registers this URI under the
+# ``ve`` prefix rather than the ``mc`` prefix files actually use, so the tag is
+# spelled out here instead of going through ``qn``.
+_MC_ALTERNATE_CONTENT: Final = (
+    "{http://schemas.openxmlformats.org/markup-compatibility/2006}AlternateContent"
+)
+_MATH_NAMESPACE: Final = "http://schemas.openxmlformats.org/officeDocument/2006/math"
+_DRAWING_2010_NAMESPACE: Final = "http://schemas.microsoft.com/office/drawing/2010/main"
+_MC_NAMESPACE: Final = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+
+
+def _iter_paragraph_elements(element: etree._Element) -> Iterator[etree._Element]:
+    """Read text and OMML in order, selecting one markup-compatibility branch."""
+    for child in element:
+        if child.tag == _MC_ALTERNATE_CONTENT:
+            branch = child.find(f"{{{_MC_NAMESPACE}}}Fallback")
+            for choice in child.findall(f"{{{_MC_NAMESPACE}}}Choice"):
+                required = choice.get("Requires", "").split()
+                if required and all(
+                    choice.nsmap.get(prefix)
+                    in {_MATH_NAMESPACE, _DRAWING_2010_NAMESPACE}
+                    for prefix in required
+                ):
+                    branch = choice
+                    break
+            if branch is not None:
+                yield from _iter_paragraph_elements(branch)
+        elif child.tag in {
+            f"{{{_DRAWING_2010_NAMESPACE}}}m",
+            f"{{{_MATH_NAMESPACE}}}oMathPara",
+        }:
+            yield from _iter_paragraph_elements(child)
+        elif child.tag in {
+            qn("a:r"),
+            qn("a:br"),
+            qn("a:fld"),
+            f"{{{_MATH_NAMESPACE}}}oMath",
+        }:
+            yield child
+
+
+def _paragraph_fragments(element: etree._Element) -> list[tuple[DocItemLabel, str]]:
+    """Coalesce adjacent text runs while keeping equations as separate fragments."""
+    fragments: list[tuple[DocItemLabel, str]] = []
+    text = ""
+    for child in _iter_paragraph_elements(element):
+        if child.tag == f"{{{_MATH_NAMESPACE}}}oMath":
+            if text:
+                fragments.append((DocItemLabel.TEXT, text))
+                text = ""
+            equation = str(oMath2Latex(child)).strip()
+            if equation:
+                fragments.append((DocItemLabel.FORMULA, equation))
+        elif isinstance(child, CT_TextLineBreak):
+            text += " "
+        else:
+            run_text = child.find(qn("a:t"))
+            if run_text is not None:
+                text += run_text.text or ""
+    if text:
+        fragments.append((DocItemLabel.TEXT, text))
+    return fragments
+
+
 _SAFE_XML_PARSER: Final = etree.XMLParser(
     resolve_entities=False,
     load_dtd=False,
@@ -91,6 +189,70 @@ _SAFE_XML_PARSER: Final = etree.XMLParser(
     dtd_validation=False,
 )
 """Safe XML parser to prevent XXE, DTD-over-network and entity-expansion attacks."""
+
+
+@dataclass
+class _OpenList:
+    """A list group that is still accepting items while a text frame is walked.
+
+    Attributes:
+        group: The list group that items at ``level`` are added to.
+        level: The paragraph level (``a:pPr/@lvl``) of the group's items.
+        counter: The number of enumerated items added to the group so far.
+        last_item: The most recent item in the group, which parents any list
+            nested below it.
+    """
+
+    group: ListGroup
+    level: int
+    counter: int = 0
+    last_item: Optional[ListItem] = None
+
+
+def _is_metafile(image_bytes: bytes) -> bool:
+    """Return True when the bytes are a Windows metafile (WMF or EMF).
+
+    Pillow renders metafiles only on Windows, where it delegates to the GDI
+    ``PlayEnhMetaFile`` API; the wheels for every other platform carry a stub
+    that raises on load. Telling a metafile apart from a genuinely broken
+    image decides whether a picture is worth rasterizing externally.
+
+    Args:
+        image_bytes: Raw bytes of an embedded picture.
+
+    Returns:
+        True when the bytes carry a placeable WMF or an EMF signature.
+    """
+    return image_bytes[:4] == _WMF_PLACEABLE_MAGIC or (
+        image_bytes[_EMF_SIGNATURE_OFFSET : _EMF_SIGNATURE_OFFSET + 4] == _EMF_SIGNATURE
+    )
+
+
+def _last_populated_row(
+    categories: list[str], columns: list[tuple[str, list[str]]], num_data_rows: int
+) -> int:
+    """Return the index of the last data row carrying any chart data.
+
+    A row is populated when its category label or at least one series value is
+    non-empty. The scan runs from the end so declared-but-empty trailing ranges
+    (e.g. whole-column references such as ``$A$2:$A$1048576``) collapse without
+    walking the empty region more than once. Interior gaps are kept: only
+    trailing empty rows are trimmed.
+
+    Args:
+        categories: Category labels, one per data row (may be shorter or longer
+            than ``num_data_rows``).
+        columns: ``(series name, values)`` pairs, one per chart series.
+        num_data_rows: Untrimmed data-row count.
+
+    Returns:
+        The last populated row index, or -1 when no row carries data.
+    """
+    for row in range(num_data_rows - 1, -1, -1):
+        category = categories[row] if row < len(categories) else ""
+        if category or any(row < len(values) and values[row] for _, values in columns):
+            return row
+    return -1
 
 
 class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentBackend):
@@ -115,6 +277,16 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
         "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
         "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     }
+    _SHAPE_ROW_TOLERANCE_EMU: Final[int] = 45720
+    """Row-grouping tolerance used by ``_iter_shapes_by_position``, in EMUs.
+
+    0.05 inch expressed in EMUs (1 inch = 914400 EMUs). This threshold is
+    intentionally small — roughly half a typical title line-height — so that
+    icon-label pairs and other tightly aligned objects on the same visual row
+    are grouped together, while shapes in separate rows (which are normally at
+    least one line-height apart) are not.
+    """
+
     # XML relationship types
     COMMENT_REL = (
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments"
@@ -143,6 +315,7 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
         self.pptx_to_pdf_converter: Optional[Callable] = None
         self.pptx_to_pdf_converter_init: bool = False
         self._render_charts: bool = False
+        self._metafile_hint_emitted: bool = False
 
         self.pptx_obj: Optional[presentation.Presentation] = None
         self.valid: bool = False
@@ -216,7 +389,7 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
     def _generate_prov(
         self, shape, slide_ind, text="", slide_size=Size(width=1, height=1)
     ):
-        if shape.left:
+        if None not in (shape.left, shape.top, shape.width, shape.height):
             left = shape.left
             top = shape.top
             width = shape.width
@@ -227,7 +400,14 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
             width = slide_size.width
             height = slide_size.height
         shape_bbox = [left, top, left + width, top + height]
-        shape_bbox = BoundingBox.from_tuple(shape_bbox, origin=CoordOrigin.BOTTOMLEFT)
+        # python-pptx reports left and top as EMU from the slide's top-left, with
+        # y growing downward, so the tuple above is in TOPLEFT order. Tagging it
+        # BOTTOMLEFT does not convert it: BoundingBox.from_tuple unpacks
+        # l, b, r, t for that origin, so the top edge lands in b and the bottom
+        # edge in t, and a consumer calling to_top_left_origin then computes
+        # page_height - t and mirrors the box. html_backend and msexcel_backend
+        # tag their own top-left coordinates TOPLEFT for the same reason.
+        shape_bbox = BoundingBox.from_tuple(shape_bbox, origin=CoordOrigin.TOPLEFT)
         prov = ProvenanceItem(
             page_no=slide_ind + 1, charspan=[0, len(text)], bbox=shape_bbox
         )
@@ -255,6 +435,27 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
             except ValueError:
                 pass
         return 0
+
+    def _get_auto_number_start(self, paragraph) -> int:
+        """Return the number an auto-numbered paragraph's list starts from.
+
+        PowerPoint records the "Start at" value of a numbered list in the
+        `startAt` attribute of the paragraph's `a:buAutoNum` element.
+
+        Args:
+            paragraph: Paragraph XML element whose start value should be extracted.
+
+        Returns:
+            The `startAt` value, or 1 when the paragraph carries no `a:buAutoNum`
+                element, no `startAt` attribute, or an invalid value.
+        """
+        bu_auto = paragraph.find("a:pPr/a:buAutoNum", namespaces=self.NAMESPACES)
+        if bu_auto is not None and "startAt" in bu_auto.attrib:
+            try:
+                return int(bu_auto.get("startAt"))
+            except ValueError:
+                pass
+        return 1
 
     def _parse_bullet_from_paragraph_properties(
         self, pPr
@@ -518,7 +719,6 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
             }
 
         # 3) Layout placeholder lstStyle (if this is a placeholder)
-        layout_result = None
         if shape.is_placeholder:
             idx = shape.placeholder_format.idx
             layout = shape.part.slide.slide_layout
@@ -538,7 +738,7 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
 
                 # Only use layout result if is_list is explicitly True/False
                 if is_list is not None:
-                    layout_result = {
+                    return {
                         "is_list": is_list,
                         "kind": kind,
                         "detail": detail,
@@ -568,11 +768,6 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
                         "level": lvl,
                     }
 
-            # If layout has explicit is_list value but master didn't override it, use
-            # layout
-            if layout_result is not None:
-                return layout_result
-
         return {
             "is_list": None,
             "kind": None,
@@ -580,56 +775,177 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
             "level": lvl,
         }
 
+    def _get_shape_position(
+        self, shape: BaseShape, attr: Literal["top", "left"]
+    ) -> Optional[int]:
+        """Return a shape position attribute as an integer for ordering.
+
+        Args:
+            shape: A python-pptx shape object. Property getters that raise are
+                silently treated as absent.
+            attr: The position attribute to read, ``"top"`` or ``"left"``.
+
+        Returns:
+            The attribute value cast to ``int``, or ``None`` if the attribute
+            is ``None``-valued or its getter raises ``AttributeError``,
+            ``ValueError``, or ``TypeError``.
+        """
+        # python-pptx wraps an element without a registered class, such as a
+        # p:contentPart inside a group, in a plain BaseShape whose getters
+        # raise AttributeError.
+        try:
+            value = shape.top if attr == "top" else shape.left
+        except (AttributeError, ValueError, TypeError):
+            return None
+
+        if value is None:
+            return None
+
+        return int(value)
+
+    def _iter_shapes_by_position(
+        self, shapes: Iterable[BaseShape]
+    ) -> Iterator[BaseShape]:
+        """Iterate shapes in visual top-to-bottom, left-to-right order.
+
+        PowerPoint stores shapes in creation/z-order, which can differ from the
+        way content is visually read on a slide. Sorting by position keeps split
+        text boxes, such as a subheading followed by its bullet text box, adjacent
+        in the extracted document.
+
+        Shapes that share a top-edge within ``row_tolerance`` EMUs of their
+        immediate predecessor (after sorting by ``top``) are placed in the same
+        row and then sorted left-to-right within that row. Adjacency is evaluated
+        against the previous shape's ``top``, not the row's first anchor, so that
+        a row can span more than one tolerance step when shapes form a contiguous
+        band. Shapes whose position attributes are unavailable or raise an
+        exception are placed at the end in their original relative order.
+
+        Args:
+            shapes: Iterable of python-pptx shape objects to sort. May be a
+                slide's top-level shape collection or the children of a group
+                shape.
+
+        Yields:
+            Shapes from ``shapes`` in visual reading order (top-to-bottom,
+            left-to-right).
+        """
+        from typing import NamedTuple
+
+        class _ShapeInfo(NamedTuple):
+            index: int
+            shape: BaseShape
+            top: int
+            left: int
+
+        row_tolerance = self._SHAPE_ROW_TOLERANCE_EMU
+        fallback_position = 2**63 - 1
+
+        entries: list[_ShapeInfo] = []
+        for index, shape in enumerate(shapes):
+            top = self._get_shape_position(shape, "top")
+            left = self._get_shape_position(shape, "left")
+            entries.append(
+                _ShapeInfo(
+                    index=index,
+                    shape=shape,
+                    top=top if top is not None else fallback_position,
+                    left=left if left is not None else fallback_position,
+                )
+            )
+
+        entries.sort(key=lambda si: (si.top, si.index))
+
+        rows: list[list[_ShapeInfo]] = []
+        current_row: list[_ShapeInfo] = []
+        prev_top = None
+
+        for entry in entries:
+            if prev_top is None or entry.top - prev_top <= row_tolerance:
+                current_row.append(entry)
+                prev_top = entry.top
+            else:
+                rows.append(current_row)
+                current_row = [entry]
+                prev_top = entry.top
+
+        if current_row:
+            rows.append(current_row)
+
+        for row in rows:
+            for si in sorted(row, key=lambda si: (si.left, si.index)):
+                yield si.shape
+
     def _handle_text_elements(
         self, shape, parent_slide, slide_ind, doc: DoclingDocument, slide_size
     ):
-        is_list_group_created = False
-        enum_list_item_value = 0
-        new_list = None
+        # Lists that are open, outermost first; a deeper paragraph level opens a
+        # list nested under the last item of the enclosing one.
+        open_lists: list[_OpenList] = []
         doc_label = DocItemLabel.LIST_ITEM
-        prov = self._generate_prov(shape, slide_ind, shape.text.strip(), slide_size)
 
         # Iterate through paragraphs to build up text
         for paragraph in shape.text_frame.paragraphs:
             is_a_list, bullet_type = self._is_list_item(paragraph)
             p = paragraph._element
 
-            # Convert line breaks to spaces and accumulate text
-            p_text = ""
-            for e in p.content_children:
-                if isinstance(e, CT_TextLineBreak):
-                    p_text += " "
-                else:
-                    p_text += e.text
+            fragments = _paragraph_fragments(p)
+            p_text = "".join(text for _, text in fragments)
+            has_equations = any(label == DocItemLabel.FORMULA for label, _ in fragments)
+
+            prov = self._generate_prov(shape, slide_ind, p_text, slide_size)
 
             if is_a_list:
                 enum_marker = ""
                 enumerated = bullet_type == "Numbered"
+                level = self._get_paragraph_level(p)
 
-                if not is_list_group_created:
-                    new_list = doc.add_list_group(
-                        name="list",
-                        parent=parent_slide,
+                while len(open_lists) > 1 and open_lists[-1].level > level:
+                    open_lists.pop()
+                if not open_lists:
+                    open_lists.append(
+                        _OpenList(
+                            group=doc.add_list_group(name="list", parent=parent_slide),
+                            level=level,
+                        )
                     )
-                    is_list_group_created = True
-                    enum_list_item_value = 0
+                elif level > open_lists[-1].level:
+                    open_lists.append(
+                        _OpenList(
+                            group=doc.add_list_group(
+                                name="list", parent=open_lists[-1].last_item
+                            ),
+                            level=level,
+                        )
+                    )
+                current = open_lists[-1]
 
                 if enumerated:
-                    enum_list_item_value += 1
-                    enum_marker = str(enum_list_item_value) + "."
+                    if current.counter == 0:
+                        current.counter = self._get_auto_number_start(p) - 1
+                    current.counter += 1
+                    enum_marker = str(current.counter) + "."
 
-                doc.add_list_item(
+                current.last_item = doc.add_list_item(
                     marker=enum_marker,
                     enumerated=enumerated,
-                    parent=new_list,
-                    text=p_text,
+                    parent=current.group,
+                    text="" if has_equations else p_text,
                     prov=prov,
                 )
+                if has_equations:
+                    inline_group = doc.add_inline_group(parent=current.last_item)
+                    for label, text in fragments:
+                        doc.add_text(
+                            label=label,
+                            parent=inline_group,
+                            text=text,
+                            prov=self._generate_prov(
+                                shape, slide_ind, text, slide_size
+                            ),
+                        )
             else:  # is paragraph not a list item
-                if is_list_group_created:
-                    is_list_group_created = False
-                    new_list = None
-                    enum_list_item_value = 0
+                open_lists.clear()
                 # Assign proper label to the text, depending if it's a Title or Section Header
                 # For other types of text, assign - PARAGRAPH
                 doc_label = DocItemLabel.PARAGRAPH
@@ -642,68 +958,137 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
                         # It's a title
                         doc_label = DocItemLabel.TITLE
 
-                # output accumulated inline text:
-                doc.add_text(
-                    label=doc_label,
-                    parent=parent_slide,
-                    text=p_text,
-                    prov=prov,
-                )
+                if has_equations:
+                    has_text = any(
+                        label != DocItemLabel.FORMULA and text.strip()
+                        for label, text in fragments
+                    )
+                    fragment_parent = parent_slide
+                    if has_text and doc_label == DocItemLabel.TITLE:
+                        fragment_parent = doc.add_text(
+                            label=doc_label, parent=parent_slide, text="", prov=prov
+                        )
+                    parent = (
+                        doc.add_inline_group(parent=fragment_parent)
+                        if has_text
+                        else fragment_parent
+                    )
+                    for label, text in fragments:
+                        if text.strip():
+                            doc.add_text(
+                                label=label,
+                                parent=parent,
+                                text=text,
+                                prov=self._generate_prov(
+                                    shape, slide_ind, text, slide_size
+                                ),
+                            )
+                else:
+                    doc.add_text(
+                        label=doc_label,
+                        parent=parent_slide,
+                        text=p_text,
+                        prov=prov,
+                    )
         return
 
-    def _handle_title(self, shape, parent_slide, slide_ind, doc):
-        placeholder_type = shape.placeholder_format.type
-        txt = shape.text.strip()
-        prov = self._generate_prov(shape, slide_ind, txt)
+    def _rasterize_metafile(self, image_bytes: bytes) -> Optional[Image.Image]:
+        """Rasterize a raw EMF or WMF picture via LibreOffice.
 
-        if len(txt.strip()) > 0:
-            # title = slide.shapes.title.text if slide.shapes.title else "No title"
-            if placeholder_type in [PP_PLACEHOLDER.CENTER_TITLE, PP_PLACEHOLDER.TITLE]:
-                _log.info(f"Title found: {shape.text}")
-                doc.add_text(
-                    label=DocItemLabel.TITLE, parent=parent_slide, text=txt, prov=prov
-                )
-            elif placeholder_type == PP_PLACEHOLDER.SUBTITLE:
-                _log.info(f"Subtitle found: {shape.text}")
-                # Using DocItemLabel.FOOTNOTE, while SUBTITLE label is not avail.
-                doc.add_text(
-                    label=DocItemLabel.SECTION_HEADER,
-                    parent=parent_slide,
-                    text=txt,
-                    prov=prov,
-                )
-        return
+        LibreOffice converts a standalone ``.emf``/``.wmf`` to PDF directly, so
+        no wrapper document is needed; the first page is then rendered with
+        pypdfium2. This is the same route ``_render_chart_image`` already takes
+        for native charts.
+
+        Args:
+            image_bytes: Raw metafile data.
+
+        Returns:
+            A PIL Image, or None when LibreOffice is unavailable or the
+            conversion fails.
+        """
+        converter = self._get_libreoffice_converter()
+        if converter is None:
+            if not self._metafile_hint_emitted:
+                self._metafile_hint_emitted = True
+                _log.warning(_IMAGE_RENDER_HINT)
+            return None
+
+        suffix = ".wmf" if image_bytes[:4] == _WMF_PLACEABLE_MAGIC else ".emf"
+        temp_dir = Path(mkdtemp())
+        try:
+            input_path = temp_dir / f"image{suffix}"
+            output_path = temp_dir / "image.pdf"
+            input_path.write_bytes(image_bytes)
+            converter(input_path, output_path)
+            if not output_path.exists():
+                _log.debug("LibreOffice produced no PDF output for %s", input_path.name)
+                return None
+            pdf = pypdfium2.PdfDocument(str(output_path))
+            page = pdf[0]
+            pil_image = crop_whitespace(page.render(scale=2).to_pil())
+            page.close()
+            pdf.close()
+            return pil_image
+        except Exception as exc:
+            _log.debug("EMF/WMF rasterization via LibreOffice failed: %s", exc)
+            return None
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _handle_pictures(self, shape, parent_slide, slide_ind, doc, slide_size):
-        # Open it with PIL
+        # Read the picture out of the package. A shape that slips past other
+        # tools' parsers can still fail here, and there is nothing to record.
         try:
-            # Get the image bytes
             image = shape.image
             image_bytes = image.blob
             im_dpi, _ = image.dpi
-            pil_image = Image.open(BytesIO(image_bytes))
-
-            # shape has picture
             prov = self._generate_prov(shape, slide_ind, "", slide_size)
-            doc.add_picture(
-                parent=parent_slide,
-                image=ImageRef.from_pil(image=pil_image, dpi=im_dpi),
-                caption=None,
-                prov=prov,
-            )
         except (
             UnidentifiedImageError,
-            OSError,
-            ValueError,
             InvalidXmlError,
             KeyError,
             AttributeError,
+            ValueError,
+            OSError,
         ) as e:
             warnings.warn(
                 f"Skipping malformed picture shape: {e}",
                 UserWarning,
                 stacklevel=2,
             )
+            return
+
+        # Open it with PIL
+        image_ref: Optional[ImageRef] = None
+        try:
+            pil_image = normalize_image_for_png(Image.open(BytesIO(image_bytes)))
+            image_ref = ImageRef.from_pil(image=pil_image, dpi=im_dpi)
+        except (UnidentifiedImageError, OSError, ValueError) as e:
+            if not _is_metafile(image_bytes):
+                warnings.warn(
+                    f"Skipping malformed picture shape: {e}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                return
+            # A metafile Pillow cannot draw on this platform. Rasterize it
+            # externally when possible, and otherwise still record the picture
+            # so its place on the slide survives -- only the pixels are lost.
+            _log.debug("Pillow cannot render this metafile: %s", e)
+            rasterized = self._rasterize_metafile(image_bytes)
+            if rasterized is not None:
+                # Rendered from a PDF rather than decoded from the original
+                # picture, so the metafile's own dpi no longer describes it;
+                # 72 matches the other LibreOffice-rendered images.
+                image_ref = ImageRef.from_pil(image=rasterized, dpi=72)
+
+        doc.add_picture(
+            parent=parent_slide,
+            image=image_ref,
+            caption=None,
+            prov=prov,
+        )
         return
 
     def _handle_tables(self, shape, parent_slide, slide_ind, doc, slide_size):
@@ -849,11 +1234,19 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
         labels on the plot (``plot.categories``) — no workbook reference
         resolution is needed.
 
+        The declared category range can far exceed the plotted data (e.g. a
+        chart referencing whole Excel columns declares ~1M categories for a
+        handful of points), so trailing rows whose category label and every
+        series value are empty are trimmed and the table is sized by populated
+        data instead. As a backstop for genuinely huge charts, the emitted
+        table is additionally capped at ``_MAX_CHART_TABLE_CELLS`` cells.
+
         Args:
             chart: A python-pptx ``Chart`` object.
 
         Returns:
-            A TableData, or None if the chart exposes no usable series.
+            A TableData, or None if the chart exposes no usable series or no
+            populated data row.
         """
         series_list = list(chart.series)
         if not series_list:
@@ -874,8 +1267,25 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
         if num_data_rows == 0:
             return None
 
-        num_rows = num_data_rows + 1
+        # Trim trailing rows that carry no data at all; interior gaps are kept.
+        num_data_rows = _last_populated_row(categories, columns, num_data_rows) + 1
+        if num_data_rows == 0:
+            return None
+
         num_cols = 1 + len(columns)
+        if num_data_rows * num_cols > _MAX_CHART_TABLE_CELLS:
+            capped_rows = max(1, _MAX_CHART_TABLE_CELLS // num_cols)
+            _log.warning(
+                "Truncating chart data table from %d to %d data rows: "
+                "%d cells would exceed the %d-cell cap.",
+                num_data_rows,
+                capped_rows,
+                num_data_rows * num_cols,
+                _MAX_CHART_TABLE_CELLS,
+            )
+            num_data_rows = capped_rows
+
+        num_rows = num_data_rows + 1
         cells: list[TableCell] = []
 
         header_labels = [""] + [name for name, _ in columns]
@@ -950,7 +1360,11 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
             chart_type = None
         classification = self._chart_type_to_classification(chart_type)
         caption_text = self._chart_title_text(chart)
-        table_data = self._chart_to_table_data(chart)
+        try:
+            table_data = self._chart_to_table_data(chart)
+        except (AttributeError, ValueError, KeyError) as exc:
+            _log.warning("Could not extract chart data: %s", exc)
+            table_data = None
 
         prov = self._generate_prov(shape, slide_ind, "", slide_size)
 
@@ -967,7 +1381,12 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
                 )
 
         caption_item = (
-            doc.add_text(label=DocItemLabel.CAPTION, text=caption_text)
+            doc.add_text(
+                label=DocItemLabel.CAPTION,
+                text=caption_text,
+                parent=parent_slide,
+                prov=self._generate_prov(shape, slide_ind, caption_text, slide_size),
+            )
             if caption_text
             else None
         )
@@ -994,17 +1413,87 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
         """Lazily initialize and return a LibreOffice converter callable.
 
         The converter accepts ``(input_path, output_path)`` and converts the
-        input file to PDF. Returns None when LibreOffice is not available.
+        input file to PDF.
+
+        Returns:
+            A converter callable, or None when LibreOffice or pypdfium2 is not
+            available; `get_docx_to_pdf_converter` checks for both.
         """
         if self.pptx_to_pdf_converter_init:
             return self.pptx_to_pdf_converter
 
         self.pptx_to_pdf_converter_init = True
-        if _CHART_RENDER_AVAILABLE:
-            self.pptx_to_pdf_converter = get_docx_to_pdf_converter()
+        self.pptx_to_pdf_converter = get_docx_to_pdf_converter()
         if self.pptx_to_pdf_converter is None:
             _log.debug("LibreOffice not found — PPTX charts will not be rendered.")
         return self.pptx_to_pdf_converter
+
+    @staticmethod
+    def _find_chart_frame(sp_tree, chart_shape_id: int):
+        """Return the graphic frame of the chart carrying ``chart_shape_id``.
+
+        The lookup is scoped to ``p:graphicFrame`` elements whose own
+        ``p:cNvPr`` carries the id, because shape ids are not reliably unique
+        within a slide: an ``mc:AlternateContent`` block repeats the same shape
+        with the same id in its ``mc:Choice`` and ``mc:Fallback``, and some
+        generators emit duplicates outright. Frames inside an
+        ``mc:AlternateContent`` are skipped — python-pptx does not treat them as
+        slide shapes, so a chart is never reached through one — and a frame
+        actually holding a chart wins over any other candidate.
+
+        Args:
+            sp_tree: The slide's ``p:spTree`` element.
+            chart_shape_id: The ``shape_id`` of the chart's graphic frame.
+
+        Returns:
+            The matching ``p:graphicFrame`` element, or None when the slide
+            carries no such frame.
+        """
+        frames = [
+            frame
+            for frame in sp_tree.xpath(
+                f'.//p:graphicFrame[p:nvGraphicFramePr/p:cNvPr/@id="{int(chart_shape_id)}"]'
+            )
+            if not any(
+                ancestor.tag == _MC_ALTERNATE_CONTENT
+                for ancestor in frame.iterancestors()
+            )
+        ]
+        if not frames:
+            return None
+
+        chart_path = f"./{qn('a:graphic')}/{qn('a:graphicData')}/{qn('c:chart')}"
+        for frame in frames:
+            if frame.find(chart_path) is not None:
+                return frame
+        return frames[0]
+
+    @staticmethod
+    def _prune_to_shape(sp_tree, shape_element) -> None:
+        """Strip a slide down to one shape, keeping the groups that hold it.
+
+        Walks from ``shape_element`` up to ``sp_tree`` and, at every level,
+        drops the siblings that are not on that path. A chart nested in a group
+        therefore keeps its enclosing ``p:grpSp`` elements, whose ``chOff`` and
+        ``chExt`` define the coordinate space its own ``xfrm`` is expressed in;
+        re-parenting the chart to the slide instead would move it. The group
+        bookkeeping children are never removed, or the file stops being valid.
+
+        Args:
+            sp_tree: The slide's ``p:spTree`` element, where pruning stops.
+            shape_element: The element of the shape to keep.
+        """
+        keep_tags = (qn("p:nvGrpSpPr"), qn("p:grpSpPr"))
+
+        node = shape_element
+        while node is not sp_tree:
+            parent = node.getparent()
+            if parent is None:
+                return
+            for sibling in list(parent):
+                if sibling is not node and sibling.tag not in keep_tags:
+                    parent.remove(sibling)
+            node = parent
 
     def _isolate_chart_presentation(
         self, slide_ind: int, chart_shape_id: int, out_path: Path
@@ -1013,10 +1502,13 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
 
         A fresh copy of the loaded presentation is reopened, every slide except
         the chart's is removed, and on that slide every shape except the chart
-        is removed. LibreOffice then renders a single-chart page. When the chart
-        is not a top-level shape (e.g. nested in a group) its ``shape_id`` is not
-        found among the slide's shapes, so the slide is left intact and the whole
-        slide is rendered instead — a best-effort fallback.
+        is removed. LibreOffice then renders a single-chart page. The chart's
+        graphic frame is looked up anywhere in the shape tree, so one nested in
+        a group is found too and only its sibling shapes are dropped.
+
+        Nothing is written when the frame cannot be found: rendering the whole
+        untouched slide would attach a slide screenshot as the chart's image,
+        which misleads downstream consumers more than having no image at all.
 
         Args:
             slide_ind: Zero-based index of the slide holding the chart.
@@ -1044,9 +1536,17 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
             if idx != slide_ind:
                 slide_id_list.remove(slide_id)
 
-        for shp in list(target_slide.shapes):
-            if shp.shape_id != chart_shape_id:
-                shp._element.getparent().remove(shp._element)
+        sp_tree = target_slide.shapes._spTree
+        chart_frame = self._find_chart_frame(sp_tree, chart_shape_id)
+        if chart_frame is None:
+            _log.warning(
+                "No chart graphic frame with shape id %s on slide %s; "
+                "keeping the chart data without an image.",
+                chart_shape_id,
+                slide_ind + 1,
+            )
+            return False
+        self._prune_to_shape(sp_tree, chart_frame)
 
         prs.save(str(out_path))
         return True
@@ -1153,20 +1653,23 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
                     self._handle_tables(shape, parent_slide, slide_ind, doc, slide_size)
                 if shape.has_chart:
                     self._handle_chart(shape, parent_slide, slide_ind, doc, slide_size)
-                if _safe_shape_type(shape) == MSO_SHAPE_TYPE.PICTURE:
-                    # Handle Pictures
+                if isinstance(shape, Picture):
+                    # Handle Pictures, including those inserted into a picture placeholder
                     self._handle_pictures(
                         shape, parent_slide, slide_ind, doc, slide_size
                     )
                 # If shape doesn't have any text, move on to the next shape
-                if not hasattr(shape, "text"):
+                if not isinstance(shape, Shape):
                     return
                 if shape.text is None:
                     return
-                if len(shape.text.strip()) == 0:
-                    return
                 if not shape.has_text_frame:
                     _log.warning("Warning: shape has text but not text_frame")
+                    return
+                if not shape.text.strip() and not any(
+                    _paragraph_fragments(paragraph._element)
+                    for paragraph in shape.text_frame.paragraphs
+                ):
                     return
                 # Handle other text elements, including lists (bullet lists, numbered
                 # lists)
@@ -1177,13 +1680,13 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
 
             def handle_groups(shape, parent_slide, slide_ind, doc, slide_size):
                 if _safe_shape_type(shape) == MSO_SHAPE_TYPE.GROUP:
-                    for groupedshape in shape.shapes:
+                    for groupedshape in self._iter_shapes_by_position(shape.shapes):
                         handle_shapes(
                             groupedshape, parent_slide, slide_ind, doc, slide_size
                         )
 
             # Loop through each shape in the slide
-            for shape in slide.shapes:
+            for shape in self._iter_shapes_by_position(slide.shapes):
                 handle_shapes(shape, parent_slide, slide_ind, doc, slide_size)
 
             # Handle notes slide
@@ -1211,7 +1714,29 @@ class MsPowerpointDocumentBackend(DeclarativeDocumentBackend, PaginatedDocumentB
                 slide, slide_ind, author_map, doc, parent_slide
             )
 
+            if slide._element.get("show") in ("0", "false"):
+                self._hide_slide(doc, parent_slide)
+
         return doc
+
+    @staticmethod
+    def _hide_slide(doc: DoclingDocument, parent_slide: GroupItem) -> None:
+        """Move the content of a hidden slide to the invisible layer.
+
+        PowerPoint does not present a slide marked ``show="0"`` (Hide Slide), so
+        it is kept like a hidden Excel sheet: available, but out of the default
+        exports. Speaker notes and comments keep the notes layer.
+        """
+        items = [
+            item
+            for item, _ in doc.iterate_items(
+                root=parent_slide,
+                with_groups=True,
+                included_content_layers={ContentLayer.BODY},
+            )
+        ]
+        for item in items:
+            item.content_layer = ContentLayer.INVISIBLE
 
     def _build_comment_author_map(
         self, pptx_obj: presentation.Presentation

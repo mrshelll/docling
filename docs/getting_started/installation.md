@@ -95,14 +95,16 @@ the following engines.
 | Engine | Installation | Usage |
 | ------ | ------------ | ----- |
 | [EasyOCR](https://github.com/JaidedAI/EasyOCR) | `easyocr` extra or via `pip install easyocr`. | `EasyOcrOptions` |
-| [Nemotron OCR](https://huggingface.co/nvidia/nemotron-ocr-v1) | `feat-ocr-nemotron` extra. Supported only on Linux x86_64 with Python 3.12 and CUDA 13.x. See installation note below. | `NemotronOcrOptions` |
+| [Nemotron OCR](https://huggingface.co/nvidia/nemotron-ocr-v2) | `feat-ocr-nemotron` extra. Supported only on Linux x86_64 with Python 3.12 and CUDA 13.x. See installation note below. | `NemotronOcrOptions` |
 | Tesseract | System dependency. See description for Tesseract and Tesserocr below.  | `TesseractOcrOptions` |
 | Tesseract CLI | System dependency. See description below. | `TesseractCliOcrOptions` |
 | OcrMac | System dependency. See description below. | `OcrMacOptions` |
 | [RapidOCR](https://github.com/RapidAI/RapidOCR) | `rapidocr` extra can or via `pip install rapidocr onnxruntime` | `RapidOcrOptions` |
 | [OnnxTR](https://github.com/felixdittrich92/OnnxTR) | Can be installed via the plugin system `pip install "docling-ocr-onnxtr[cpu]"`. Please take a look at [docling-OCR-OnnxTR](https://github.com/felixdittrich92/docling-OCR-OnnxTR).| `OnnxtrOcrOptions` |
 
-The Docling `DocumentConverter` allows you to choose the OCR engine with the `ocr_options` settings. For example
+The Docling `DocumentConverter` allows you to choose the OCR engine with the `ocr_options` settings.
+Whichever engine you pick, its languages are given as BCP-47 tags -- see
+[OCR engines](../concepts/OCR.md#language-selection). For example
 
 ```python
 from docling.datamodel.base_models import InputFormat
@@ -167,7 +169,7 @@ doc_converter = DocumentConverter(
 
 ??? "Nemotron OCR installation"
 
-    [Nemotron OCR](https://huggingface.co/nvidia/nemotron-ocr-v1) requires the CUDA 13 PyTorch wheels.
+    [Nemotron OCR](https://huggingface.co/nvidia/nemotron-ocr-v2) requires the CUDA 13 PyTorch wheels.
     Install it with the `feat-ocr-nemotron` extra, the CUDA 13 PyTorch index, and the `unsafe-best-match`
     index strategy so `pip` resolves the CUDA-enabled `torch` packages correctly.
 

@@ -1,8 +1,15 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Client SDK for interacting with docling-serve."""
 
 from docling.datamodel.service.requests import (
     AnyHttpSourceRequest,
+    BatchSourceRequestInput,
     BatchSourceRequestItem,
+    BatchTargetRequestInput,
+    GenericSourceRequest,
+    GenericTargetRequest,
     S3SourceRequest,
 )
 from docling.datamodel.service.responses import (
@@ -43,13 +50,17 @@ __all__ = [
     "ArtifactDownloadError",
     "AsyncConversionJob",
     "AsyncDoclingServiceClient",
+    "BatchSourceRequestInput",
     "BatchSourceRequestItem",
+    "BatchTargetRequestInput",
     "ChunkerKind",
     "ConversionError",
     "ConversionItem",
     "ConversionJob",
     "DoclingServiceClient",
     "DoclingServiceClientError",
+    "GenericSourceRequest",
+    "GenericTargetRequest",
     "PresignedUrlConvertDocumentResponse",
     "PresignedUrlConvertResponse",
     "PresignedUrlTarget",

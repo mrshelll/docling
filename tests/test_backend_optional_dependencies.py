@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Regression tests for optional format-backend dependencies.
 
 ``DocumentConverter`` imports every format backend eagerly (see
@@ -16,6 +19,7 @@ from pathlib import Path
 import pytest
 
 _EML_SAMPLE = Path(__file__).parent / "data" / "email" / "sources" / "eml_simple.eml"
+_MSG_SAMPLE = Path(__file__).parent / "data" / "email" / "sources" / "msg_simple.msg"
 _HTML_SAMPLE = Path(__file__).parent / "data" / "html" / "sources" / "hyperlink_01.html"
 _MD_SAMPLE = Path(__file__).parent / "data" / "md" / "sources" / "mixed.md"
 _DOCX_SAMPLE = Path(__file__).parent / "data" / "docx" / "sources" / "word_tables.docx"
@@ -28,6 +32,7 @@ _TEX_SAMPLE = (
 )
 _JATS_SAMPLE = Path(__file__).parent / "data" / "jats" / "sources" / "pone.0234687.nxml"
 _USPTO_SAMPLE = Path(__file__).parent / "data" / "uspto" / "sources" / "ipg08672134.xml"
+_PDF_SAMPLE = Path(__file__).parent / "data" / "pdf" / "bookmark_sample.pdf"
 
 
 def _run_with_blocked_module(
@@ -46,7 +51,18 @@ def _run_with_blocked_module(
 
 @pytest.mark.parametrize(
     "blocked_module",
-    ["mailparser", "marko", "docx", "pptx", "openpyxl", "pylatexenc", "bs4"],
+    [
+        "mailparser",
+        "oxmsg",
+        "marko",
+        "docx",
+        "pptx",
+        "openpyxl",
+        "pylatexenc",
+        "bs4",
+        "pypdfium2",
+        "docling_parse",
+    ],
 )
 def test_converter_constructs_without_optional_backend_dependency(
     blocked_module: str,
@@ -69,6 +85,14 @@ def test_converter_constructs_without_optional_backend_dependency(
             "docling.backend.email_backend",
             "EmailDocumentBackend",
             _EML_SAMPLE,
+            "EMAIL",
+            "format-email",
+        ),
+        (
+            "oxmsg",
+            "docling.backend.email_backend",
+            "EmailDocumentBackend",
+            _MSG_SAMPLE,
             "EMAIL",
             "format-email",
         ),
@@ -136,6 +160,14 @@ def test_converter_constructs_without_optional_backend_dependency(
             "XML_USPTO",
             "format-xml-uspto",
         ),
+        (
+            "docling_parse",
+            "docling.backend.docling_parse_backend",
+            "ThreadedDoclingParseDocumentBackend",
+            _PDF_SAMPLE,
+            "PDF",
+            "format-pdf-docling",
+        ),
     ],
 )
 def test_backend_reports_missing_dependency_with_install_hint(
@@ -174,5 +206,124 @@ def test_service_client_imports_without_pdf_pipeline_dependency() -> None:
         "pypdfium2",
         "import docling.service_client\n"
         "from docling.datamodel.service.options import ConvertDocumentsOptions\n",
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_docling_parse_backend_operates_without_pypdfium2() -> None:
+    sample = Path(__file__).parent / "data" / "pdf" / "bookmark_sample.pdf"
+    body = (
+        "from pathlib import Path\n"
+        "from docling.backend.docling_parse_backend import "
+        "ThreadedDoclingParseDocumentBackend\n"
+        "from docling.datamodel.base_models import InputFormat\n"
+        "from docling.datamodel.document import InputDocument\n"
+        f"path = Path({str(sample)!r})\n"
+        "in_doc = InputDocument(path_or_stream=path, format=InputFormat.PDF, "
+        "backend=ThreadedDoclingParseDocumentBackend)\n"
+        "backend = in_doc._backend\n"
+        "page = next(backend.iter_pages())\n"
+        "assert page.get_page_image().width > 0\n"
+        "backend.unload()\n"
+    )
+
+    result = _run_with_blocked_module("pypdfium2", body)
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize(
+    ("backend_import", "backend_class", "sample", "fmt"),
+    [
+        (
+            "docling.backend.msexcel_backend",
+            "MsExcelDocumentBackend",
+            _XLSX_SAMPLE,
+            "XLSX",
+        ),
+        (
+            "docling.backend.msword_backend",
+            "MsWordDocumentBackend",
+            _DOCX_SAMPLE,
+            "DOCX",
+        ),
+        (
+            "docling.backend.mspowerpoint_backend",
+            "MsPowerpointDocumentBackend",
+            _PPTX_SAMPLE,
+            "PPTX",
+        ),
+        (
+            "docling.backend.latex_backend",
+            "LatexDocumentBackend",
+            _TEX_SAMPLE,
+            "LATEX",
+        ),
+    ],
+)
+def test_office_and_latex_backends_convert_without_pypdfium2(
+    backend_import: str,
+    backend_class: str,
+    sample: Path,
+    fmt: str,
+) -> None:
+    # pypdfium2 ships with the PDF extras, and these backends need it only to
+    # rasterize embedded charts and EMF/WMF pictures. Text, tables, and chart
+    # data must still convert without it, the way they do when LibreOffice is
+    # absent.
+    body = (
+        "from pathlib import Path\n"
+        f"from {backend_import} import {backend_class}\n"
+        "from docling.datamodel.base_models import InputFormat\n"
+        "from docling.datamodel.document import InputDocument\n"
+        f"path = Path({str(sample)!r})\n"
+        "in_doc = InputDocument(path_or_stream=path, "
+        f"format=InputFormat.{fmt}, backend={backend_class})\n"
+        "doc = in_doc._backend.convert()\n"
+        "assert doc.texts or doc.tables\n"
+    )
+
+    result = _run_with_blocked_module("pypdfium2", body)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_powerpoint_uses_shared_pypdfium2_guard() -> None:
+    # PowerPoint used to gate the shared converter factory behind its own
+    # pypdfium2 import. On slim installs that bypassed the factory entirely, so
+    # users never saw its actionable install hint. Multiple backend instances
+    # must now reach the shared guard while the warning is still emitted once.
+    body = (
+        "import logging\n"
+        "from docling.backend.mspowerpoint_backend import "
+        "MsPowerpointDocumentBackend\n"
+        "logging.basicConfig(level=logging.WARNING, format='%(message)s')\n"
+        "for _ in range(3):\n"
+        "    backend = object.__new__(MsPowerpointDocumentBackend)\n"
+        "    backend.pptx_to_pdf_converter = None\n"
+        "    backend.pptx_to_pdf_converter_init = False\n"
+        "    assert backend._get_libreoffice_converter() is None\n"
+    )
+
+    result = _run_with_blocked_module("pypdfium2", body)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr.count("format-pdf-pypdfium2") == 1, result.stderr
+
+
+def test_converter_constructs_without_chart_extraction_dependency() -> None:
+    """Importing DocumentConverter must not require transformers.
+
+    docling-slim[models-onnxruntime] ships without torch or transformers.
+    This regression test verifies the import is fully deferred behind the
+    `do_chart_extraction` flag.
+
+    Note: torch cannot be blocked via sys.modules here because scipy (an
+    unrelated transitive dependency) also inspects sys.modules["torch"] and
+    crashes on None.
+    """
+    result = _run_with_blocked_module(
+        "transformers",
+        "from docling.document_converter import DocumentConverter\nDocumentConverter()\n",
     )
     assert result.returncode == 0, result.stderr

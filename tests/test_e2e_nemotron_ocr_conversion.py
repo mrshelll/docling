@@ -1,10 +1,15 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
 import pytest
+import torch
 
-from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
+from docling.backend.docling_parse_backend import ThreadedDoclingParseDocumentBackend
 from docling.datamodel.accelerator_options import (
     AcceleratorDevice,
     AcceleratorOptions,
@@ -13,22 +18,57 @@ from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import (
     NemotronOcrOptions,
+    OcrMode,
     OcrOptions,
     PdfPipelineOptions,
 )
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.exceptions import OcrLanguageNotSupportedError
 from docling.models.stages.ocr.nemotron_ocr_model import (
     NemotronOcrModel,
-    resolve_nemotronocr_language,
 )
+from docling.utils.ocr_language import OcrLanguageResolver
 
-from .groundtruth_paths import get_ocr_groundtruth_paths
+from .groundtruth_paths import (
+    GroundTruthPaths,
+    get_regular_groundtruth_paths,
+    resolve_gt_ocr_mode,
+)
 from .test_data_gen_flag import GEN_TEST_DATA
 from .verify_utils import verify_conversion_result_v2
 
 _log = logging.getLogger(__name__)
 
 GENERATE_V2 = GEN_TEST_DATA
+
+# cuBLAS reads this only at handle-creation time (first inference, during test
+# execution), so setting it at module import is early enough. Required by
+# use_deterministic_algorithms() for deterministic cuBLAS GEMMs. Test-only: the
+# library/CLI never import this file.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _deterministic_kernels():
+    """Force deterministic OCR so the fuzzy GT bbox check is stable"""
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
+def get_nemotron_ocr_groundtruth_paths(
+    input_path: Path,
+    *,
+    mode: OcrMode,
+) -> GroundTruthPaths:
+    """Build GT paths for nemotron OCR, organized by OCR mode.
+
+    Each mode maps to a sub-directory named after ``mode.value``; files are tagged
+    ``nemotron_ocr.<mode.value>``. DEFAULT shares PDF_AWARE_LAYOUT_REGIONS' ground truth.
+    """
+    model_name = "nemotron_ocr"
+    mode = resolve_gt_ocr_mode(mode)
+    gt_dir = input_path.parent.parent / "groundtruth" / model_name / mode.value
+    tag = f"{model_name}.{mode.value}"
+    return get_regular_groundtruth_paths(input_path, gt_dir=gt_dir, tag=tag)
 
 
 def _nemotron_available() -> bool:
@@ -80,7 +120,7 @@ def get_converter(ocr_options: OcrOptions, ocr_batch_size: Optional[int] = None)
         format_options={
             InputFormat.PDF: PdfFormatOption(
                 pipeline_options=pipeline_options,
-                backend=DoclingParseDocumentBackend,
+                backend=ThreadedDoclingParseDocumentBackend,
             )
         }
     )
@@ -89,54 +129,59 @@ def get_converter(ocr_options: OcrOptions, ocr_batch_size: Optional[int] = None)
 
 
 @pytest.mark.parametrize(
-    ("req_languages", "expected"),
+    ("tag", "expected"),
     [
-        # No request -> english default
-        (None, "english"),
-        ([], "english"),
-        # English aliases (and case / whitespace / region-tag normalization)
-        (["en"], "english"),
-        (["eng"], "english"),
-        (["english"], "english"),
-        (["EN"], "english"),
-        (["English"], "english"),
-        (["  en  "], "english"),
-        (["en-US"], "english"),
-        (["en_US"], "english"),
-        (["en", "english", "eng"], "english"),
-        # Any non-english language maps to multilingual
-        (["de"], "multilingual"),
-        (["fr"], "multilingual"),
-        (["zh-CN"], "multilingual"),
-        # A single non-english language is enough to promote the whole request
-        (["en", "de"], "multilingual"),
-        (["de", "en"], "multilingual"),
+        # Every spelling of English canonicalizes to the same recognizer.
+        ("en", "english"),
+        ("eng", "english"),
+        ("EN", "english"),
+        ("  en  ", "english"),
+        ("en-US", "english"),
+        # The languages the multilingual checkpoint is trained on.
+        ("zh-CN", "multilingual"),
+        ("zh-Hant", "multilingual"),
+        ("ja", "multilingual"),
+        ("ko", "multilingual"),
+        ("ru", "multilingual"),
+        # ...and the explicit escape hatch.
+        ("mul", "multilingual"),
     ],
 )
-def test_nemotron_language_resolution(req_languages, expected):
-    assert resolve_nemotronocr_language(req_languages) == expected
+def test_nemotron_language_mapping(tag, expected):
+    model = NemotronOcrModel.__new__(NemotronOcrModel)
+    assert (
+        model.map_ocr_language(OcrLanguageResolver.canonicalize_ocr_language(tag))
+        == expected
+    )
+
+
+@pytest.mark.parametrize("tag", ["de", "fr", "ar", "hi"])
+def test_nemotron_rejects_uncovered_language(tag):
+    """A language neither checkpoint serves errors instead of silently
+    falling back to the multilingual model, which is what used to happen."""
+    model = NemotronOcrModel.__new__(NemotronOcrModel)
+    with pytest.raises(OcrLanguageNotSupportedError, match="mul"):
+        model.map_ocr_language(OcrLanguageResolver.canonicalize_ocr_language(tag))
 
 
 def test_e2e_nemotron_ocr_conversions():
-    directory = Path("./tests/data/scanned/sources")
+    directory = Path("./tests/data/ocr/sources")
 
     # List all PDF files in the directory and its subdirectories
     pdf_paths = sorted(directory.rglob("ocr_test*.pdf"))
 
-    configs: list[tuple[OcrOptions, str]] = [
-        (NemotronOcrOptions(), "nemotron-ocr"),  # Default options
-        (NemotronOcrOptions(batch_size=3), "nemotron-ocr"),  # Lower batch_size
-        (
-            NemotronOcrOptions(force_full_page_ocr=True),
-            "nemotron-ocr.full-page",
-        ),  # Full page
+    configs: list[OcrOptions] = [
+        NemotronOcrOptions(),  # Default options
+        NemotronOcrOptions(batch_size=3),
+        NemotronOcrOptions(mode=OcrMode.FULL_PAGE),
+        NemotronOcrOptions(mode=OcrMode.LAYOUT_REGIONS),
     ]
 
-    for ocr_options, engine_suffix in configs:
+    for ocr_options in configs:
         print(
             f"Converting with ocr_engine: {ocr_options.kind}, "
             f"merge_level: {ocr_options.merge_level}, "
-            f"force_full_page_ocr: {ocr_options.force_full_page_ocr}"
+            f"mode: {ocr_options.mode}"
         )
         converter = get_converter(ocr_options=ocr_options)
         for pdf_path in pdf_paths:
@@ -145,7 +190,7 @@ def test_e2e_nemotron_ocr_conversions():
             doc_result: ConversionResult = converter.convert(pdf_path)
 
             verify_conversion_result_v2(
-                gt=get_ocr_groundtruth_paths(pdf_path, engine=engine_suffix),
+                gt=get_nemotron_ocr_groundtruth_paths(pdf_path, mode=ocr_options.mode),
                 doc_result=doc_result,
                 generate=GENERATE_V2,
                 fuzzy=True,
@@ -154,31 +199,28 @@ def test_e2e_nemotron_ocr_conversions():
 
 def test_e2e_nemotron_ocr_multipage_batching():
     """Exercise cross-page batching and the per-page redistribution of results."""
-    pdf_path = Path("./tests/data/scanned/sources/nemotron_multipage.pdf")
+    pdf_path = Path("./tests/data/ocr/sources/nemotron_multipage.pdf")
 
     # Reference GT is generated with batch_size=1
     # During test the batch_size is chosen not to divide the number of pages, to ensure batches
     # that span across pages
     batch_size = 1 if GENERATE_V2 else 3
 
-    configs: list[tuple[OcrOptions, str]] = [
-        (NemotronOcrOptions(batch_size=batch_size), "nemotron-ocr"),
-        (
-            NemotronOcrOptions(batch_size=batch_size, force_full_page_ocr=True),
-            "nemotron-ocr.full-page",
-        ),
+    configs: list[OcrOptions] = [
+        NemotronOcrOptions(batch_size=batch_size),
+        NemotronOcrOptions(batch_size=batch_size, mode=OcrMode.FULL_PAGE),
     ]
 
-    for ocr_options, engine_suffix in configs:
+    for ocr_options in configs:
         print(
             f"Converting multi-page with batch_size: {ocr_options.batch_size}, "
-            f"force_full_page_ocr: {ocr_options.force_full_page_ocr}"
+            f"mode: {ocr_options.mode}"
         )
         converter = get_converter(ocr_options=ocr_options, ocr_batch_size=batch_size)
         doc_result: ConversionResult = converter.convert(pdf_path)
 
         verify_conversion_result_v2(
-            gt=get_ocr_groundtruth_paths(pdf_path, engine=engine_suffix),
+            gt=get_nemotron_ocr_groundtruth_paths(pdf_path, mode=ocr_options.mode),
             doc_result=doc_result,
             generate=GENERATE_V2,
             fuzzy=True,

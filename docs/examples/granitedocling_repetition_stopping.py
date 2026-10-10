@@ -18,6 +18,7 @@
 # %%
 
 import logging
+from pathlib import Path
 
 from docling.datamodel import vlm_model_specs
 from docling.datamodel.base_models import InputFormat
@@ -37,8 +38,8 @@ logging.basicConfig(level=logging.INFO)
 # Replace with a local path if preferred.
 # source = "https://ibm.biz/docling-page-with-table" # Example that shows no repetitions.
 source = (
-    "tests/data/scanned/sources/old_newspaper.png"  # Example that creates repetitions.
-)
+    Path(__file__).parent / "data" / "old_newspaper.png"
+)  # Example that creates repetitions.
 print(f"Processing document: {source}")
 
 ###### USING GRANITEDOCLING WITH CUSTOM REPETITION STOPPING (LEGACY)

@@ -2,7 +2,7 @@
 # Detect language automatically with Tesseract OCR and force full-page OCR.
 #
 # What this example does
-# - Configures Tesseract (CLI in this snippet) with `lang=["auto"]`.
+# - Configures Tesseract (CLI in this snippet) with an empty `lang` list.
 # - Forces full-page OCR and prints the recognized text as Markdown.
 #
 # How to run
@@ -12,8 +12,10 @@
 # Notes
 # - You can switch to `TesseractOcrOptions` instead of `TesseractCliOcrOptions`.
 # - Language packs must be installed; set `TESSDATA_PREFIX` if Tesseract
-#   cannot find language data. Using `lang=["auto"]` requires traineddata
-#   that supports script/language detection on your system.
+#   cannot find language data. An empty `lang` list means "let the engine
+#   decide": for Tesseract that is per-page orientation and script detection,
+#   which requires the `osd` traineddata plus the per-script files it may
+#   detect.
 
 # %%
 
@@ -22,6 +24,7 @@ from pathlib import Path
 
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import (
+    OcrMode,
     PdfPipelineOptions,
     TesseractCliOcrOptions,
 )
@@ -38,13 +41,11 @@ def main():
     data_folder = Path(__file__).parent / "../../tests/data"
     input_doc_path = data_folder / "pdf/sources/2206.01062.pdf"
 
-    # Set lang=["auto"] with a tesseract OCR engine: TesseractOcrOptions, TesseractCliOcrOptions
-    # ocr_options = TesseractOcrOptions(lang=["auto"])
-    ocr_options = TesseractCliOcrOptions(lang=["auto"])
+    # Set lang=[] with a tesseract OCR engine: TesseractOcrOptions, TesseractCliOcrOptions
+    # ocr_options = TesseractOcrOptions(lang=[], mode=OcrMode.FULL_PAGE)
+    ocr_options = TesseractCliOcrOptions(lang=[], mode=OcrMode.FULL_PAGE)
 
-    pipeline_options = PdfPipelineOptions(
-        do_ocr=True, force_full_page_ocr=True, ocr_options=ocr_options
-    )
+    pipeline_options = PdfPipelineOptions(do_ocr=True, ocr_options=ocr_options)
 
     converter = DocumentConverter(
         format_options={

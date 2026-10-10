@@ -1,3 +1,7 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -11,11 +15,15 @@ from docling.datamodel.base_models import (
 )
 from docling.datamodel.pipeline_options import PictureDescriptionApiOptions
 from docling.datamodel.pipeline_options_vlm_model import ApiVlmOptions, ResponseFormat
-from docling.datamodel.vlm_engine_options import ApiVlmEngineOptions
+from docling.datamodel.vlm_engine_options import (
+    ApiVlmEngineOptions,
+    MlxVlmEngineOptions,
+)
 from docling.models.inference_engines.vlm.api_openai_compatible_engine import (
     ApiVlmEngine,
 )
 from docling.models.inference_engines.vlm.base import VlmEngineInput
+from docling.models.inference_engines.vlm.mlx_engine import MlxVlmEngine
 from docling.models.stages.picture_description.picture_description_api_model import (
     PictureDescriptionApiModel,
 )
@@ -115,6 +123,28 @@ def test_api_vlm_engine_preserves_usage_on_output_metadata(
     assert output.metadata["usage"] == api_result.usage
 
 
+def test_mlx_vlm_engine_records_generated_token_count() -> None:
+    engine = MlxVlmEngine(options=MlxVlmEngineOptions(), artifacts_path=None)
+    engine._initialized = True
+    engine.vlm_model = object()
+    engine.processor = object()
+    engine.config = object()
+    engine.apply_chat_template = lambda *_args, **_kwargs: "formatted prompt"
+    engine.stream_generate = lambda *_args, **_kwargs: iter(
+        [
+            SimpleNamespace(text="first "),
+            SimpleNamespace(text="second "),
+            SimpleNamespace(text="third"),
+        ]
+    )
+
+    input_data = VlmEngineInput(image=Image.new("RGB", (8, 8)), prompt="Describe")
+    output = engine.predict_batch([input_data])[0]
+
+    assert output.text == "first second third"
+    assert output.metadata["num_tokens"] == 3
+
+
 def test_picture_description_api_model_forwards_usage_response_key() -> None:
     model = PictureDescriptionApiModel(
         enabled=True,
@@ -138,3 +168,109 @@ def test_picture_description_api_model_forwards_usage_response_key() -> None:
         result = next(model._annotate_images([Image.new("RGB", (8, 8))]))
 
     assert result.text == "description"
+
+
+def test_picture_description_vlm_engine_model_preserves_usage() -> None:
+    from docling.datamodel.pipeline_options import PictureDescriptionVlmEngineOptions
+    from docling.models.inference_engines.vlm.base import VlmEngineOutput
+    from docling.models.stages.picture_description.picture_description_vlm_engine_model import (
+        PictureDescriptionVlmEngineModel,
+    )
+
+    class _DummyEngine:
+        def predict_batch(self, inputs):
+            return [
+                VlmEngineOutput(
+                    text="a beautiful sunset",
+                    stop_reason="end_of_sequence",
+                    metadata={
+                        "usage": {
+                            "prompt_tokens": 15,
+                            "completion_tokens": 25,
+                            "total_tokens": 40,
+                        },
+                        "num_tokens": 40,
+                    },
+                )
+            ]
+
+        def cleanup(self):
+            pass
+
+    options = PictureDescriptionVlmEngineOptions.from_preset("smolvlm")
+    model = PictureDescriptionVlmEngineModel.__new__(PictureDescriptionVlmEngineModel)
+    model.options = options
+    model.engine = _DummyEngine()
+
+    results = list(model._annotate_images([Image.new("RGB", (8, 8))]))
+    assert len(results) == 1
+    assert isinstance(results[0], ApiImageRequestResult)
+    assert results[0].text == "a beautiful sunset"
+    assert results[0].num_tokens == 40
+    assert results[0].stop_reason == VlmStopReason.END_OF_SEQUENCE
+    assert results[0].usage == {
+        "prompt_tokens": 15,
+        "completion_tokens": 25,
+        "total_tokens": 40,
+    }
+
+
+def test_picture_description_vlm_engine_model_populates_picture_meta_usage() -> None:
+    from unittest.mock import patch
+
+    from docling_core.types.doc import DoclingDocument
+
+    from docling.datamodel.accelerator_options import AcceleratorOptions
+    from docling.datamodel.base_models import ItemAndImageEnrichmentElement
+    from docling.datamodel.pipeline_options import PictureDescriptionVlmEngineOptions
+    from docling.models.inference_engines.vlm.base import VlmEngineOutput
+    from docling.models.stages.picture_description.picture_description_vlm_engine_model import (
+        PictureDescriptionVlmEngineModel,
+    )
+
+    class _DummyEngine:
+        def predict_batch(self, inputs):
+            return [
+                VlmEngineOutput(
+                    text="a red square",
+                    stop_reason="end_of_sequence",
+                    metadata={"usage": {"total_tokens": 12}, "num_tokens": 12},
+                )
+            ]
+
+        def cleanup(self):
+            pass
+
+    options = PictureDescriptionVlmEngineOptions.from_preset("smolvlm")
+    with patch(
+        "docling.models.stages.picture_description.picture_description_vlm_engine_model.create_vlm_engine",
+        return_value=_DummyEngine(),
+    ):
+        model = PictureDescriptionVlmEngineModel(
+            enabled=True,
+            enable_remote_services=False,
+            artifacts_path=None,
+            options=options,
+            accelerator_options=AcceleratorOptions(),
+        )
+
+    doc = DoclingDocument(name="test")
+    doc.add_picture()
+    image = Image.new("RGB", (20, 20), "red")
+
+    enriched = list(
+        model(
+            doc=doc,
+            element_batch=[
+                ItemAndImageEnrichmentElement(item=doc.pictures[0], image=image)
+            ],
+        )
+    )
+
+    assert len(enriched) == 1
+    picture = enriched[0]
+    assert picture.meta is not None
+    assert picture.meta.description is not None
+    assert picture.meta.description.get_custom_part()["docling__usage"] == {
+        "total_tokens": 12
+    }

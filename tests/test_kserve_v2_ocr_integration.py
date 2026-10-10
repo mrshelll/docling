@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Opt-in integration test for KServe v2 OCR."""
 
 import os
@@ -6,11 +9,15 @@ from pathlib import Path
 
 import pytest
 
-from docling.backend.docling_parse_backend import DoclingParseDocumentBackend
+from docling.backend.docling_parse_backend import ThreadedDoclingParseDocumentBackend
 from docling.datamodel.accelerator_options import AcceleratorDevice
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import ConversionResult
-from docling.datamodel.pipeline_options import KserveV2OcrOptions, PdfPipelineOptions
+from docling.datamodel.pipeline_options import (
+    KserveV2OcrOptions,
+    OcrMode,
+    PdfPipelineOptions,
+)
 from docling.document_converter import DocumentConverter, PdfFormatOption
 
 from .groundtruth_paths import get_ocr_groundtruth_paths
@@ -27,9 +34,10 @@ KSERVE_OCR_URL_ENVS = {
 KSERVE_OCR_TRANSPORTS = ["http", "grpc"]
 KSERVE_OCR_LANGUAGES = [
     "en",
-    "ch",
+    "zh-Hans",
+    # PP-OCR's script recognizers, named by their own tokens.
     "arabic",
-    "korean",
+    "ko",
     "latin",
 ]
 
@@ -42,7 +50,7 @@ KSERVE_OCR_LANGUAGES = [
     ),
 )
 def test_kserve_v2_ocr_conversion() -> None:
-    input_path = Path("tests/data/scanned/sources/ocr_test.pdf")
+    input_path = Path("tests/data/ocr/sources/ocr_test.pdf")
 
     for transport in KSERVE_OCR_TRANSPORTS:
         url = os.environ[KSERVE_OCR_URL_ENVS[transport]]
@@ -50,6 +58,7 @@ def test_kserve_v2_ocr_conversion() -> None:
             pipeline_options = PdfPipelineOptions()
             pipeline_options.accelerator_options.device = AcceleratorDevice.CPU
             pipeline_options.do_table_structure = False
+            pipeline_options.enable_remote_services = True
             pipeline_options.ocr_options = KserveV2OcrOptions(
                 url=url,
                 transport=transport,
@@ -62,7 +71,7 @@ def test_kserve_v2_ocr_conversion() -> None:
                 format_options={
                     InputFormat.PDF: PdfFormatOption(
                         pipeline_options=pipeline_options,
-                        backend=DoclingParseDocumentBackend,
+                        backend=ThreadedDoclingParseDocumentBackend,
                     )
                 }
             )
@@ -70,7 +79,11 @@ def test_kserve_v2_ocr_conversion() -> None:
             doc_result: ConversionResult = converter.convert(input_path)
 
             verify_conversion_result_v2(
-                gt=get_ocr_groundtruth_paths(input_path, engine="kserve_v2_ocr"),
+                gt=get_ocr_groundtruth_paths(
+                    input_path,
+                    engine=pipeline_options.ocr_options.kind,
+                    mode=OcrMode.FULL_PAGE,
+                ),
                 doc_result=doc_result,
                 generate=GEN_TEST_DATA,
                 fuzzy=True,

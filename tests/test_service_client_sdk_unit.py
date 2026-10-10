@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 import asyncio
 import io
 import json
@@ -7,7 +10,8 @@ import threading
 import time
 import warnings
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import format_datetime
 from pathlib import Path, PurePath
 from types import MethodType, SimpleNamespace
 
@@ -793,8 +797,8 @@ def test_convert_all_returns_iterator_and_yields_before_batch_completion(
         build_thread = threading.Thread(target=build_iterator)
         build_thread.start()
 
-        iterator_or_exc = iterator_queue.get(timeout=0.2)
-        build_thread.join(timeout=0.2)
+        iterator_or_exc = iterator_queue.get(timeout=5.0)
+        build_thread.join(timeout=5.0)
 
         if isinstance(iterator_or_exc, BaseException):
             raise iterator_or_exc
@@ -816,8 +820,8 @@ def test_convert_all_returns_iterator_and_yields_before_batch_completion(
         assert first_result_queue.empty()
 
         release_first.set()
-        first_result_or_exc = first_result_queue.get(timeout=0.2)
-        first_thread.join(timeout=0.2)
+        first_result_or_exc = first_result_queue.get(timeout=5.0)
+        first_thread.join(timeout=5.0)
 
         if isinstance(first_result_or_exc, BaseException):
             raise first_result_or_exc
@@ -1493,7 +1497,8 @@ def test_submit_file_forwards_request_headers(tmp_path: Path) -> None:
     assert captured["header_api"] == "base-key"
 
 
-def test_serialize_convert_options_omits_defaults_and_none() -> None:
+def test_serialize_convert_options_omits_unset_and_none() -> None:
+    """Fields not passed by the caller are omitted; explicitly-set None is omitted too."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with DoclingServiceClient(url=TEST_BASE_URL) as client:
@@ -1509,6 +1514,27 @@ def test_serialize_convert_options_omits_defaults_and_none() -> None:
         "PydanticSerializationUnexpectedValue" not in str(warning.message)
         for warning in caught
     )
+
+
+def test_serialize_convert_options_includes_explicitly_set_defaults() -> None:
+    """A field explicitly set to its default value must appear in the payload."""
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        # do_chart_extraction defaults to False; setting it explicitly must send it.
+        payload = client._serialize_convert_options(
+            ConvertDocumentsRequestOptions(do_chart_extraction=False)
+        )
+
+    assert "do_chart_extraction" in payload
+    assert payload["do_chart_extraction"] is False
+
+
+def test_serialize_convert_options_omits_unset_fields() -> None:
+    """Fields never passed to the constructor must not appear in the payload."""
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        payload = client._serialize_convert_options(ConvertDocumentsRequestOptions())
+
+    assert "do_chart_extraction" not in payload
+    assert "do_ocr" not in payload
 
 
 def test_form_encode_options_jsonifies_nested_values() -> None:
@@ -1923,18 +1949,38 @@ def test_submit_batch_posts_batch_request() -> None:
                 HttpSourceRequest(
                     url="https://example.org/sample.pdf",
                     headers={"Authorization": "Bearer source-token"},
-                )
+                ),
+                {
+                    "kind": "filenet",
+                    "base_url": "https://filenet.example.com/graphql",
+                    "api_key": "filenet-secret",
+                    "repository_id": "OS1",
+                },
             ],
             output_formats=[OutputFormat.MARKDOWN],
-            target=PresignedUrlTarget(),
+            target={
+                "kind": "plugin_artifact_store",
+                "bucket": "out",
+                "api_key": "target-secret",
+            },
         )
 
     assert job.task_id == "task-batch"
     assert captured["path"] == "/v1/convert/source/batch"
-    assert '"kind":"presigned_url"' in str(captured["payload"])
+    assert json.loads(str(captured["payload"]))["target"] == {
+        "kind": "plugin_artifact_store",
+        "bucket": "out",
+        "api_key": "target-secret",
+    }
     assert '"headers":{"Authorization":"Bearer source-token"}' in str(
         captured["payload"]
     )
+    assert json.loads(str(captured["payload"]))["sources"][1] == {
+        "kind": "filenet",
+        "base_url": "https://filenet.example.com/graphql",
+        "api_key": "filenet-secret",
+        "repository_id": "OS1",
+    }
 
 
 def test_submit_batch_serializes_inline_gcs_secrets_without_redaction() -> None:
@@ -2052,7 +2098,7 @@ def test_submit_batch_returns_presigned_result_for_presigned_target() -> None:
 
     with DoclingServiceClient(url=TEST_BASE_URL) as client:
         client._submit_batch_task = MethodType(
-            lambda self, sources, options, target, request_headers=None: (
+            lambda self, sources, options, target, targets=None, request_headers=None: (
                 _status_response("task-presigned-batch", "pending")
             ),
             client,
@@ -2086,7 +2132,7 @@ def test_submit_batch_returns_counts_result_for_s3_target() -> None:
 
     with DoclingServiceClient(url=TEST_BASE_URL) as client:
         client._submit_batch_task = MethodType(
-            lambda self, sources, options, target, request_headers=None: (
+            lambda self, sources, options, target, targets=None, request_headers=None: (
                 _status_response("task-s3", "pending")
             ),
             client,
@@ -2121,6 +2167,40 @@ def test_submit_batch_returns_counts_result_for_s3_target() -> None:
         result = job.result(timeout=1.0)
 
     assert result is s3_result
+
+
+def test_submit_batch_returns_counts_result_for_generic_target() -> None:
+    storage_result = PresignedUrlConvertDocumentResponse(
+        num_converted=1,
+        num_succeeded=1,
+        num_partially_succeeded=0,
+        num_failed=0,
+        processing_time=0.25,
+    )
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._submit_batch_task = MethodType(
+            lambda self, sources, options, target, targets=None, request_headers=None: (
+                _status_response("task-plugin-target", "pending")
+            ),
+            client,
+        )
+        client._wait_for_terminal_status = MethodType(
+            lambda self, task_id, timeout: _status_response(task_id, "success"),
+            client,
+        )
+        client._fetch_presigned_document_result = MethodType(
+            lambda self, task_id, last_status: storage_result,
+            client,
+        )
+
+        job = client.submit_batch(
+            sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            target={"kind": "plugin_artifact_store", "bucket": "out"},
+        )
+        result = job.result(timeout=1.0)
+
+    assert result is storage_result
 
 
 def test_submit_returns_counts_result_for_storage_target() -> None:
@@ -2400,6 +2480,35 @@ def test_429_without_retry_after_header_does_not_retry() -> None:
             )
 
     assert call_count == 1
+
+
+def test_retry_after_http_date_with_unknown_timezone_does_not_crash() -> None:
+    # RFC 7231 mandates GMT, but non-conformant servers/proxies emit dates with
+    # an unknown timezone ("-0000"), which email.utils parses to a naive
+    # datetime. The backoff computation must not raise when mixing that with an
+    # aware "now".
+    response = httpx.Response(
+        503, headers={"Retry-After": "Sun, 06 Nov 1994 08:49:37 -0000"}
+    )
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        delay = client._retry_after_delay_seconds(response)
+
+    assert isinstance(delay, float)
+    assert delay == 0.0  # a date in the past clamps to zero
+
+
+def test_retry_after_future_http_date_returns_positive_delay() -> None:
+    future = datetime.now(tz=timezone.utc) + timedelta(seconds=120)
+    response = httpx.Response(
+        503, headers={"Retry-After": format_datetime(future, usegmt=True)}
+    )
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        delay = client._retry_after_delay_seconds(response)
+
+    assert isinstance(delay, float)
+    assert 0.0 < delay <= 120.0
 
 
 def test_402_usage_limit_exceeded_raises_explicit_exception() -> None:
@@ -3552,14 +3661,18 @@ async def test_async_submit_batch_posts_batch_request() -> None:
 
     async with _make_async_http_client(handler) as client:
         job = await client.submit_batch(
-            sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            sources=[{"kind": "filenet", "repository_id": "OS1"}],
             output_formats=[OutputFormat.MARKDOWN],
-            target=PresignedUrlTarget(),
+            target={"kind": "plugin_artifact_store", "bucket": "out"},
         )
 
     assert job.task_id == "task-batch"
     assert "/v1/convert/source/batch" in str(captured["url"])
-    assert captured["json"] is not None
+    assert captured["json"]["sources"] == [{"kind": "filenet", "repository_id": "OS1"}]
+    assert captured["json"]["target"] == {
+        "kind": "plugin_artifact_store",
+        "bucket": "out",
+    }
 
 
 @pytest.mark.anyio
@@ -3589,7 +3702,7 @@ async def test_async_submit_batch_returns_presigned_result() -> None:
 
     async with AsyncDoclingServiceClient(url=TEST_BASE_URL) as client:
         client._submit_batch_task = MethodType(
-            lambda self, sources, options, target, async_client, request_headers=None: (
+            lambda self, sources, options, target, async_client, targets=None, request_headers=None: (
                 asyncio.sleep(
                     0, result=_status_response("task-presigned-batch", "pending")
                 )
@@ -3633,7 +3746,7 @@ async def test_async_submit_batch_returns_counts_result_for_s3_target() -> None:
 
     async with AsyncDoclingServiceClient(url=TEST_BASE_URL) as client:
         client._submit_batch_task = MethodType(
-            lambda self, sources, options, target, async_client, request_headers=None: (
+            lambda self, sources, options, target, async_client, targets=None, request_headers=None: (
                 asyncio.sleep(0, result=_status_response("task-s3", "pending"))
             ),
             client,
@@ -3689,7 +3802,7 @@ async def test_async_submit_batch_returns_counts_result_for_azure_target() -> No
 
     async with AsyncDoclingServiceClient(url=TEST_BASE_URL) as client:
         client._submit_batch_task = MethodType(
-            lambda self, sources, options, target, async_client, request_headers=None: (
+            lambda self, sources, options, target, async_client, targets=None, request_headers=None: (
                 asyncio.sleep(0, result=_status_response("task-azure", "pending"))
             ),
             client,
@@ -4070,3 +4183,229 @@ async def test_async_submit_and_retrieve_each_rejects_invalid_max_in_flight(
                 target=InBodyTarget(),
             ):
                 pass
+
+
+# --- submit_batch multi-target ---
+
+
+def test_submit_batch_posts_targets_list_to_batch_endpoint() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json=_status_response("task-multi-target", "pending").model_dump(
+                mode="json"
+            ),
+        )
+
+    transport = httpx.MockTransport(handler)
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._http_client.close()
+        client._http_client = httpx.Client(
+            transport=transport,
+            timeout=client._http_client.timeout,
+        )
+        job = client.submit_batch(
+            sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            targets=[
+                S3Target(
+                    endpoint="s3.example.org",
+                    access_key="a",
+                    secret_key="b",
+                    bucket="output-s3",
+                ),
+                PresignedUrlTarget(),
+            ],
+        )
+
+    assert job.task_id == "task-multi-target"
+    assert captured["path"] == "/v1/convert/source/batch"
+    payload = captured["payload"]
+    assert "target" not in payload
+    assert isinstance(payload["targets"], list)
+    assert len(payload["targets"]) == 2
+    assert payload["targets"][0]["kind"] == "s3"
+    assert payload["targets"][1]["kind"] == "presigned_url"
+
+
+def test_submit_batch_requires_target_or_targets() -> None:
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        with pytest.raises(ValueError, match="requires either"):
+            client.submit_batch(
+                sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            )
+
+
+def test_submit_batch_rejects_both_target_and_targets() -> None:
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        with pytest.raises(ValueError, match="supply only one"):
+            client.submit_batch(
+                sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+                target=PresignedUrlTarget(),
+                targets=[PresignedUrlTarget()],
+            )
+
+
+def test_submit_batch_returns_storage_result_for_targets_list_with_storage_target() -> (
+    None
+):
+    storage_result = PresignedUrlConvertDocumentResponse(
+        num_converted=1,
+        num_succeeded=1,
+        num_partially_succeeded=0,
+        num_failed=0,
+        processing_time=0.25,
+    )
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._submit_batch_task = MethodType(
+            lambda self, sources, options, target, targets=None, request_headers=None: (
+                _status_response("task-multi-storage", "pending")
+            ),
+            client,
+        )
+        client._wait_for_terminal_status = MethodType(
+            lambda self, task_id, timeout: _status_response(task_id, "success"),
+            client,
+        )
+        client._fetch_presigned_document_result = MethodType(
+            lambda self, task_id, last_status: storage_result,
+            client,
+        )
+
+        job = client.submit_batch(
+            sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            targets=[
+                S3Target(
+                    endpoint="s3.example.org",
+                    access_key="a",
+                    secret_key="b",
+                    bucket="output",
+                ),
+                PresignedUrlTarget(),
+            ],
+        )
+        result = job.result(timeout=1.0)
+
+    assert result is storage_result
+
+
+def test_submit_batch_returns_presigned_result_for_targets_list_without_storage() -> (
+    None
+):
+    presigned_result = PresignedUrlConvertResponse(
+        num_converted=1,
+        num_succeeded=1,
+        num_partially_succeeded=0,
+        num_failed=0,
+        processing_time=0.25,
+        documents=[],
+    )
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        client._submit_batch_task = MethodType(
+            lambda self, sources, options, target, targets=None, request_headers=None: (
+                _status_response("task-multi-presigned", "pending")
+            ),
+            client,
+        )
+        client._wait_for_terminal_status = MethodType(
+            lambda self, task_id, timeout: _status_response(task_id, "success"),
+            client,
+        )
+        client._fetch_presigned_result = MethodType(
+            lambda self, task_id, last_status: presigned_result,
+            client,
+        )
+
+        job = client.submit_batch(
+            sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            targets=[PresignedUrlTarget()],
+        )
+        result = job.result(timeout=1.0)
+
+    assert result is presigned_result
+
+
+@pytest.mark.anyio
+async def test_async_submit_batch_posts_targets_list() -> None:
+    captured: dict[str, object] = {}
+
+    def handler(method: str, url: str, **kw: object) -> httpx.Response:
+        captured["url"] = url
+        captured["json"] = kw.get("json")
+        return httpx.Response(
+            200,
+            json=_status_response("task-async-multi", "pending").model_dump(
+                mode="json"
+            ),
+        )
+
+    async with _make_async_http_client(handler) as client:
+        job = await client.submit_batch(
+            sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            targets=[
+                S3Target(
+                    endpoint="s3.example.org",
+                    access_key="a",
+                    secret_key="b",
+                    bucket="output",
+                ),
+                PresignedUrlTarget(),
+            ],
+        )
+
+    assert job.task_id == "task-async-multi"
+    assert "/v1/convert/source/batch" in str(captured["url"])
+    payload = captured["json"]
+    assert "target" not in payload
+    assert isinstance(payload["targets"], list)
+    assert len(payload["targets"]) == 2
+    assert payload["targets"][0]["kind"] == "s3"
+    assert payload["targets"][1]["kind"] == "presigned_url"
+
+
+@pytest.mark.anyio
+async def test_async_submit_batch_requires_target_or_targets() -> None:
+    async with AsyncDoclingServiceClient(url=TEST_BASE_URL) as client:
+        with pytest.raises(ValueError, match="requires either"):
+            await client.submit_batch(
+                sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+            )
+
+
+@pytest.mark.anyio
+async def test_async_submit_batch_rejects_both_target_and_targets() -> None:
+    async with AsyncDoclingServiceClient(url=TEST_BASE_URL) as client:
+        with pytest.raises(ValueError, match="supply only one"):
+            await client.submit_batch(
+                sources=[AnyHttpSourceRequest(url="https://example.org/sample.pdf")],
+                target=PresignedUrlTarget(),
+                targets=[PresignedUrlTarget()],
+            )
+
+
+_ACCEPT_DOC_VERSION_HEADER = "Accept-Docling-Document-Version"
+
+
+def test_sync_client_stamps_accept_doc_version_header() -> None:
+    from docling_core.types.doc.common.constants import CURRENT_VERSION
+
+    with DoclingServiceClient(url=TEST_BASE_URL) as client:
+        assert (
+            client._http_client.headers[_ACCEPT_DOC_VERSION_HEADER] == CURRENT_VERSION
+        )
+
+
+@pytest.mark.anyio
+async def test_async_client_stamps_accept_doc_version_header() -> None:
+    from docling_core.types.doc.common.constants import CURRENT_VERSION
+
+    async with AsyncDoclingServiceClient(url=TEST_BASE_URL) as client:
+        assert (
+            client._async_client.headers[_ACCEPT_DOC_VERSION_HEADER] == CURRENT_VERSION
+        )

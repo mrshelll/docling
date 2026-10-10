@@ -1,11 +1,14 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 import os
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from docling.backend.docling_parse_backend import (
-    DoclingParseDocumentBackend,
     ThreadedDoclingParseDocumentBackend,
 )
 from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
@@ -21,9 +24,11 @@ from docling.datamodel.image_classification_engine_options import (
     ApiKserveV2ImageClassificationEngineOptions,
 )
 from docling.datamodel.pipeline_options import (
+    EasyOcrOptions,
     NemotronOcrOptions,
     PdfPipelineOptions,
     TableFormerMode,
+    TesseractCliOcrOptions,
 )
 from docling.document_converter import (
     ConversionError,
@@ -31,7 +36,9 @@ from docling.document_converter import (
     PdfFormatOption,
 )
 from docling.models.factories import get_ocr_factory
+from docling.models.stages.ocr.easyocr_model import EasyOcrModel
 from docling.models.stages.ocr.nemotron_ocr_model import NemotronOcrModel
+from docling.models.stages.ocr.tesseract_ocr_cli_model import TesseractOcrCliModel
 from docling.pipeline.legacy_standard_pdf_pipeline import LegacyStandardPdfPipeline
 
 
@@ -183,6 +190,7 @@ def test_document_timeout(test_doc_path):
             InputFormat.PDF: PdfFormatOption(
                 pipeline_options=PdfPipelineOptions(document_timeout=1),
                 pipeline_cls=LegacyStandardPdfPipeline,
+                backend=PyPdfiumDocumentBackend,
             )
         }
     )
@@ -241,8 +249,8 @@ def test_invalid_input_unreadable_source_with_exception_surfaces_error_details()
 
     with (
         patch.object(
-            docling_parse_backend_module.pdfium,
-            "PdfDocument",
+            docling_parse_backend_module.DoclingThreadedPdfParser,
+            "load",
             side_effect=RuntimeError("bad trailer"),
         ),
         pytest.raises(
@@ -455,24 +463,31 @@ def test_page_error_carries_page_no(test_doc_path):
         assert not err.error_message.startswith("Page ")
 
 
-def test_ocr_coverage_threshold(test_doc_path):
-    pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
-    pipeline_options.ocr_options.bitmap_area_threshold = 1.1
+def test_ocr_scale_is_configurable():
+    """The OCR render scale comes from the options instead of a hardcoded 3."""
+    assert TesseractCliOcrOptions().scale == 3.0
+    assert EasyOcrOptions().scale == 3.0
 
-    converter = DocumentConverter(
-        format_options={
-            InputFormat.PDF: PdfFormatOption(
-                pipeline_options=pipeline_options,
-            )
-        }
+    accelerator_options = AcceleratorOptions()
+
+    tesseract_model = TesseractOcrCliModel(
+        enabled=False,
+        artifacts_path=None,
+        options=TesseractCliOcrOptions(scale=1.0),
+        accelerator_options=accelerator_options,
     )
+    assert tesseract_model.scale == 1.0
 
-    test_doc_path = Path("./tests/data/scanned/sources/ocr_test.pdf")
-    doc_result: ConversionResult = converter.convert(test_doc_path)
+    easyocr_model = EasyOcrModel(
+        enabled=False,
+        artifacts_path=None,
+        options=EasyOcrOptions(scale=1.5),
+        accelerator_options=accelerator_options,
+    )
+    assert easyocr_model.scale == 1.5
 
-    # this should have generated no results, since we set a very high threshold
-    assert len(doc_result.document.texts) == 0
+    with pytest.raises(ValidationError):
+        TesseractCliOcrOptions(scale=0)
 
 
 def test_nemotron_ocr_backend_registration():
@@ -494,7 +509,6 @@ def test_parser_backends(test_doc_path):
     pipeline_options.do_table_structure = False
 
     for backend_t in [
-        DoclingParseDocumentBackend,
         ThreadedDoclingParseDocumentBackend,
         PyPdfiumDocumentBackend,
     ]:
@@ -564,7 +578,7 @@ def test_pipeline_cache_with_chart_extraction():
 
     with (
         patch(
-            "docling.pipeline.base_pipeline.ChartExtractionModelGraniteVisionV4"
+            "docling.models.stages.chart_extraction.granite_vision.ChartExtractionVlmEngineModel"
         ) as mock_chart,
         patch(
             "docling.pipeline.base_pipeline.DocumentPictureClassifier"

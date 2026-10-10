@@ -3,6 +3,12 @@
 This file provides guidance to AI coding agents when working with code in this
 repository.
 
+## Communication
+
+Use ASD-STE100 Simplified Technical English when you communicate with the user.
+Use short sentences, active voice, and consistent terms. Keep code identifiers,
+API names, and quoted source text exact. State the result and any limits clearly.
+
 ## Project overview
 
 Docling is a Python SDK and CLI for converting PDFs, Office files, HTML,
@@ -13,12 +19,29 @@ Markdown, audio, images, XML, and other formats into a unified
 
 ```text
 docling/                 # main Python package
+docling/.agents/skills/  # usage skills shipped inside the package (see below)
 packages/docling/        # full docling meta-package
 packages/docling-slim/   # slim package readme
 tests/                   # pytest suite and test data
 docs/                    # MkDocs documentation and examples
 scripts/                 # project maintenance scripts
 ```
+
+## Skills
+
+- **Development skills** (for contributors working *on* Docling) live in
+  [`.agents/skills/`](.agents/skills/) at the repo root, e.g. `dignified-python`
+  and `building-pydantic-ai-agents`.
+  Select the applicable skills from the
+  [task routes](.agents/skills/skill-router.json). For PR reviews and re-reviews,
+  use [review](.agents/skills/review/SKILL.md) before you assess the changes.
+- **Usage skills** (for agents *using* Docling to convert documents) are shipped
+  inside the package at
+  [`docling/.agents/skills/docling/`](docling/.agents/skills/docling/SKILL.md).
+  They are packaged into the wheel/sdist so they are discoverable via
+  `uvx`-style library skills once `docling` is installed. Keep them in sync with
+  the CLI, the SDK (`PipelineOptions`), the Service Client, and the
+  `docling-slim` extras when user-facing behavior changes.
 
 ## Key commands
 

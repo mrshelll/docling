@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Backends to parse OpenDocument formats (ODT, ODS, ODP).
 
 The backends leverage the ``odfdo`` library (https://github.com/jdum/odfdo) to
@@ -17,6 +20,8 @@ Known gaps to improve:
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -30,6 +35,7 @@ from docling_core.types.doc import (
     DocItemLabel,
     DoclingDocument,
     DocumentOrigin,
+    FineRef,
     Formatting,
     GroupLabel,
     ImageRef,
@@ -48,12 +54,15 @@ from docling_core.types.doc import (
     TabularChartMetaField,
 )
 from PIL import Image as PILImage
+from pydantic import AnyUrl, ValidationError
 from typing_extensions import override
 
 from docling.backend.abstract_backend import (
     DeclarativeDocumentBackend,
     PaginatedDocumentBackend,
 )
+from docling.backend.utils.image import normalize_image_for_png
+from docling.backend.utils.image_resource_loader import ImageResourceLoader
 from docling.datamodel.backend_options import OdsBackendOptions
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.document import InputDocument
@@ -64,11 +73,13 @@ try:  # pragma: no cover - import-time guard
     from odfdo import (
         Document as OdfDocument,
         DrawPage,
+        Element,
         Frame,
         Header,
         List as OdfList,
         ListItem,
         Paragraph,
+        Section,
         Table as OdfTable,
     )
 
@@ -92,6 +103,48 @@ _ODF_CHART_CLASS_TO_PICTURE_CLASSIFICATION = {
 }
 
 
+class _OdfComments:
+    """ODT comment threads, keyed by the paragraph or heading that holds them."""
+
+    def __init__(self, threads: list[tuple[Element | None, list[str]]]) -> None:
+        # Keyed by the lxml element: odfdo builds a new wrapper on every access.
+        self._threads: dict[Any, list[tuple[int, list[str]]]] = {}
+        for index, (anchor, thread) in enumerate(threads, start=1):
+            key = None if anchor is None else anchor._xml_element
+            self._threads.setdefault(key, []).append((index, thread))
+
+    def attach(
+        self, doc: DoclingDocument, item: NodeItem | None, blocks: list[Element]
+    ) -> None:
+        """Add the threads of these paragraphs as children of the item."""
+        for block in blocks:
+            for index, thread in self._threads.pop(block._xml_element, []):
+                self._add_group(doc, item, index, thread)
+
+    def attach_rest(self, doc: DoclingDocument) -> None:
+        """Add the threads whose paragraph made no item to the root."""
+        rest = sorted(t for threads in self._threads.values() for t in threads)
+        self._threads.clear()
+        for index, thread in rest:
+            self._add_group(doc, None, index, thread)
+
+    @staticmethod
+    def _add_group(
+        doc: DoclingDocument, item: NodeItem | None, index: int, thread: list[str]
+    ) -> None:
+        group = doc.add_group(
+            label=GroupLabel.COMMENT_SECTION,
+            name=f"comment-{index}",
+            parent=item,
+            content_layer=ContentLayer.NOTES,
+        )
+        for comment in thread:
+            doc.add_comment(text=comment, parent=group)
+        # As in the DOCX backend. An InlineGroup has no comments field.
+        if isinstance(item, DocItem):
+            item.comments.append(FineRef(cref=group.self_ref))
+
+
 @dataclass
 class _OdfListState:
     group: NodeItem
@@ -104,6 +157,27 @@ class _OdfListState:
 class _OdfTextRun:
     text: str
     formatting: Formatting | None = None
+    hyperlink: AnyUrl | Path | None = None
+
+
+_ODF_HREF_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
+
+def _odf_hyperlink_from_href(href: str | None) -> AnyUrl | Path | None:
+    if href is None:
+        return None
+    href = href.strip()
+    if not href:
+        return None
+    try:
+        return AnyUrl(href)
+    except ValidationError:
+        if _ODF_HREF_SCHEME_RE.match(href):
+            # Looks like an attempted absolute URL (has a scheme) that failed
+            # to parse, e.g. a malformed host. Don't guess by treating it as
+            # a filesystem path.
+            return None
+        return Path(href)
 
 
 def _load_odf_document(
@@ -136,6 +210,7 @@ class _OdfBaseBackend(DeclarativeDocumentBackend):
             raise ImportError(_INSTALL_HINT) from _ODFDO_IMPORT_ERROR
         super().__init__(in_doc, path_or_stream, options)
         self.path_or_stream: BytesIO | Path = path_or_stream
+        self.page_range = in_doc.limits.page_range
         self.valid: bool = False
         self.odf_obj: OdfDocument = _load_odf_document(
             path_or_stream, self.document_hash
@@ -146,6 +221,10 @@ class _OdfBaseBackend(DeclarativeDocumentBackend):
                 f"{self.odf_obj.get_type()!r}"
             )
         self.valid = True
+        self._image_loader = ImageResourceLoader(
+            enable_local_fetch=self.options.enable_local_fetch,
+            enable_remote_fetch=self.options.enable_remote_fetch,
+        )
 
     @override
     def is_valid(self) -> bool:
@@ -156,6 +235,35 @@ class _OdfBaseBackend(DeclarativeDocumentBackend):
         if isinstance(self.path_or_stream, BytesIO):
             self.path_or_stream.close()
         self.path_or_stream = None
+
+    def _add_footnotes(self, doc: DoclingDocument, comments: _OdfComments) -> None:
+        """Add footnote/endnote body text to the furniture layer.
+
+        ``_odf_text_runs`` skips ``text:note`` entirely wherever it's referenced
+        inline (see its own docstring), since splicing an arbitrary-length note
+        body into the middle of the citing sentence would corrupt the reading
+        order rather than just losing content. This recovers the body text
+        separately: each note becomes its own ``FOOTNOTE`` item in the furniture
+        layer, the same layer headers/footers use in the Word/iWork backends -
+        available to callers, out of the reading order by default.
+        """
+        for note in self.odf_obj.body.get_elements("descendant::text:note"):
+            bodies = note.get_elements("text:note-body")
+            if not bodies:
+                continue
+            text = bodies[0].text_content.strip()
+            if not text:
+                continue
+            item = doc.add_text(
+                label=DocItemLabel.FOOTNOTE,
+                text=text,
+                content_layer=ContentLayer.FURNITURE,
+            )
+            comments.attach(
+                doc,
+                item,
+                bodies[0].get_elements("descendant::text:p | descendant::text:h"),
+            )
 
 
 def _find_true_data_bounds(table: OdfTable) -> tuple[int, int, int, int]:
@@ -173,10 +281,16 @@ def _find_true_data_bounds(table: OdfTable) -> tuple[int, int, int, int]:
     """
     min_row, min_col = None, None
     max_row, max_col = 0, 0
+    # Extent of the rows and cells actually present in the table, used to keep
+    # merged ranges from reaching past the table.
+    last_row, last_col = 0, 0
+    span_max_row, span_max_col = 0, 0
 
     # Scan all rows and cells to find non-empty cells
     for row_idx, row in enumerate(table.traverse()):
+        last_row = row_idx
         for col_idx, cell in enumerate(row.traverse()):
+            last_col = max(last_col, col_idx)
             # Check if cell has content (value or is part of a span)
             if _odf_cell_has_content(cell) or cell.tag == "table:covered-table-cell":
                 if min_row is None:
@@ -189,21 +303,31 @@ def _find_true_data_bounds(table: OdfTable) -> tuple[int, int, int, int]:
             # Also check for cells with spans (they define data regions)
             if cell.tag != "table:covered-table-cell":
                 attrs = cell.attributes
-                row_span = int(attrs.get("table:number-rows-spanned") or 1)
-                col_span = int(attrs.get("table:number-columns-spanned") or 1)
+                row_span = _odf_span(attrs, "table:number-rows-spanned")
+                col_span = _odf_span(attrs, "table:number-columns-spanned")
                 if row_span > 1 or col_span > 1:
                     if min_row is None:
                         min_row = row_idx
                     if min_col is None or col_idx < min_col:
                         min_col = col_idx
-                    max_row = max(max_row, row_idx + row_span - 1)
-                    max_col = max(max_col, col_idx + col_span - 1)
+                    span_max_row = max(span_max_row, row_idx + row_span - 1)
+                    span_max_col = max(span_max_col, col_idx + col_span - 1)
 
     # If no data found, return empty bounds
     if min_row is None or min_col is None:
         return (0, 0, 0, 0)
 
+    max_row = max(max_row, min(span_max_row, last_row))
+    max_col = max(max_col, min(span_max_col, last_col))
     return (min_row, max_row, min_col, max_col)
+
+
+def _odf_span(attrs: dict[str, str], key: str) -> int:
+    """Read a ``table:number-*-spanned`` attribute as a span of at least 1."""
+    try:
+        return max(int(attrs.get(key) or 1), 1)
+    except ValueError:
+        return 1
 
 
 def _clean_odf_text_lines(text: str) -> list[str]:
@@ -301,33 +425,53 @@ def _odf_text_runs(
     element: Any,
     odf_obj: OdfDocument | None,
     inherited_formatting: Formatting | None = None,
+    inherited_hyperlink: AnyUrl | Path | None = None,
 ) -> list[_OdfTextRun]:
-    style_name = getattr(element, "attributes", {}).get("text:style-name")
+    style_name = element.attributes.get("text:style-name")
     formatting = _formatting_from_odf_text_style(
         odf_obj, style_name, inherited_formatting
     )
-    tag = getattr(element, "tag", None)
+    tag = element.tag
+    hyperlink = (
+        _odf_hyperlink_from_href(element.attributes.get("xlink:href"))
+        if tag == "text:a"
+        else inherited_hyperlink
+    )
     if tag == "text:line-break":
-        text = getattr(element, "text", "\n") or "\n"
-        text_recursive = getattr(element, "text_recursive", "")
-        if text_recursive.startswith(text):
-            text = text_recursive
-        return [_OdfTextRun(text=text, formatting=formatting)]
+        return [
+            _OdfTextRun(
+                text=element.text or "\n", formatting=formatting, hyperlink=hyperlink
+            )
+        ]
     if tag == "text:tab":
-        return [_OdfTextRun(text="\t", formatting=formatting)]
+        return [_OdfTextRun(text="\t", formatting=formatting, hyperlink=hyperlink)]
+    if tag == "text:note":
+        # A footnote/endnote's citation marker and body live inside this element,
+        # but neither belongs in the citing sentence's own text: the body can be
+        # arbitrarily long, and splicing it in here would corrupt the reading
+        # order instead of just losing content. The body is recovered separately
+        # as its own furniture item; see _OdfBaseBackend._add_footnotes.
+        return []
 
     runs: list[_OdfTextRun] = []
-    text = getattr(element, "text", "")
+    children = element.children
+    text = element.text
     if text:
-        runs.append(_OdfTextRun(text=text, formatting=formatting))
+        runs.append(_OdfTextRun(text=text, formatting=formatting, hyperlink=hyperlink))
 
-    for child in getattr(element, "children", []):
-        runs.extend(_odf_text_runs(child, odf_obj, formatting))
+    for child in children:
+        runs.extend(_odf_text_runs(child, odf_obj, formatting, hyperlink))
+        if child.tail:
+            runs.append(
+                _OdfTextRun(text=child.tail, formatting=formatting, hyperlink=hyperlink)
+            )
 
-    if not runs and not getattr(element, "children", []):
-        text_recursive = getattr(element, "text_recursive", "")
-        if text_recursive:
-            runs.append(_OdfTextRun(text=text_recursive, formatting=formatting))
+    if not runs and not children:
+        inner_text = element.inner_text
+        if inner_text:
+            runs.append(
+                _OdfTextRun(text=inner_text, formatting=formatting, hyperlink=hyperlink)
+            )
 
     return runs
 
@@ -337,10 +481,24 @@ def _normalize_odf_text_runs(runs: list[_OdfTextRun]) -> list[_OdfTextRun]:
     for run in runs:
         if run.text == "":
             continue
-        if merged_runs and merged_runs[-1].formatting == run.formatting:
+        if (
+            merged_runs
+            and merged_runs[-1].formatting == run.formatting
+            and merged_runs[-1].hyperlink == run.hyperlink
+        ):
             merged_runs[-1].text += run.text
-        else:
-            merged_runs.append(_OdfTextRun(text=run.text, formatting=run.formatting))
+            continue
+
+        text = run.text
+        if merged_runs and merged_runs[-1].hyperlink != run.hyperlink:
+            # A hyperlink boundary is a hard edge: strip the whitespace right
+            # at the boundary so it doesn't double up with the separator the
+            # markdown/inline serializer already inserts between runs.
+            merged_runs[-1].text = merged_runs[-1].text.rstrip()
+            text = text.lstrip()
+        merged_runs.append(
+            _OdfTextRun(text=text, formatting=run.formatting, hyperlink=run.hyperlink)
+        )
 
     while merged_runs and merged_runs[0].text.strip() == "":
         merged_runs.pop(0)
@@ -378,6 +536,7 @@ def _add_odf_text_runs(
             text=runs[0].text,
             content_layer=content_layer,
             formatting=runs[0].formatting,
+            hyperlink=runs[0].hyperlink,
         )
 
     inline_group = doc.add_inline_group(parent=parent, content_layer=content_layer)
@@ -388,8 +547,50 @@ def _add_odf_text_runs(
             text=run.text,
             content_layer=content_layer,
             formatting=run.formatting,
+            hyperlink=run.hyperlink,
         )
     return inline_group
+
+
+def _add_odf_rich_block(
+    doc: DoclingDocument,
+    runs: list[_OdfTextRun],
+    *,
+    add_block: Callable[..., NodeItem],
+    parent: NodeItem | None,
+    content_layer: ContentLayer | None,
+) -> NodeItem | None:
+    """Add a heading/title-like block from text runs.
+
+    A single run becomes the block directly. Multiple runs (e.g. a heading
+    with a hyperlink or mixed formatting in the middle) become one empty
+    block wrapping an InlineGroup of TEXT runs, so the block stays a single
+    semantic item instead of fragmenting into several headings/titles.
+    """
+    runs = _normalize_odf_text_runs(runs)
+    if not runs:
+        return None
+    if len(runs) == 1:
+        return add_block(
+            text=runs[0].text,
+            parent=parent,
+            content_layer=content_layer,
+            formatting=runs[0].formatting,
+            hyperlink=runs[0].hyperlink,
+        )
+
+    block = add_block(text="", parent=parent, content_layer=content_layer)
+    inline_group = doc.add_inline_group(parent=block, content_layer=content_layer)
+    for run in runs:
+        doc.add_text(
+            label=DocItemLabel.TEXT,
+            parent=inline_group,
+            text=run.text,
+            content_layer=content_layer,
+            formatting=run.formatting,
+            hyperlink=run.hyperlink,
+        )
+    return block
 
 
 def _add_odf_heading(
@@ -399,32 +600,19 @@ def _add_odf_heading(
     parent: NodeItem | None,
     content_layer: ContentLayer | None,
     odf_obj: OdfDocument | None,
+    comments: _OdfComments | None = None,
 ) -> None:
-    level = element.get_attribute_integer("text:outline-level") or 1
+    level = max(1, element.get_attribute_integer("text:outline-level") or 1)
     runs = _odf_text_runs(element, odf_obj)
-    runs = _normalize_odf_text_runs(runs)
-    text = _odf_text_from_runs(runs)
-    if not text:
-        return
-    if len(runs) == 1:
-        doc.add_heading(
-            parent=parent,
-            text=text,
-            level=max(1, level),
-            content_layer=content_layer,
-            formatting=runs[0].formatting,
-        )
-        return
-
-    inline_group = doc.add_inline_group(parent=parent, content_layer=content_layer)
-    for run in runs:
-        doc.add_heading(
-            parent=inline_group,
-            text=run.text,
-            level=max(1, level),
-            content_layer=content_layer,
-            formatting=run.formatting,
-        )
+    item = _add_odf_rich_block(
+        doc,
+        runs,
+        add_block=lambda **kwargs: doc.add_heading(level=level, **kwargs),
+        parent=parent,
+        content_layer=content_layer,
+    )
+    if comments is not None:
+        comments.attach(doc, item, [element])
 
 
 def _odf_paragraph_style_names(
@@ -458,6 +646,8 @@ def _add_odf_paragraph(
     parent: NodeItem | None,
     content_layer: ContentLayer | None,
     odf_obj: OdfDocument | None,
+    image_loader: ImageResourceLoader | None = None,
+    comments: _OdfComments | None = None,
 ) -> None:
     chart_count = _add_odf_charts(doc, element, parent, content_layer, odf_obj)
     images = element.get_images()
@@ -467,6 +657,7 @@ def _add_odf_paragraph(
         parent,
         content_layer,
         odf_obj,
+        image_loader=image_loader,
         skip_object_replacements=chart_count > 0,
     )
     runs = _odf_text_runs(element, odf_obj)
@@ -483,31 +674,31 @@ def _add_odf_paragraph(
 
     style_names = _odf_paragraph_style_names(odf_obj, element)
     if "Title" in style_names:
-        _add_odf_text_runs(
+        item = _add_odf_rich_block(
             doc,
             runs,
-            label=DocItemLabel.TITLE,
+            add_block=lambda **kwargs: doc.add_text(label=DocItemLabel.TITLE, **kwargs),
             parent=parent,
             content_layer=content_layer,
         )
     elif "Subtitle" in style_names:
-        text = _odf_text_from_runs(runs)
-        if text:
-            doc.add_heading(
-                parent=parent,
-                text=text,
-                level=1,
-                content_layer=content_layer,
-                formatting=runs[0].formatting if len(runs) == 1 else None,
-            )
+        item = _add_odf_rich_block(
+            doc,
+            runs,
+            add_block=lambda **kwargs: doc.add_heading(level=1, **kwargs),
+            parent=parent,
+            content_layer=content_layer,
+        )
     else:
-        _add_odf_text_runs(
+        item = _add_odf_text_runs(
             doc,
             runs,
             label=DocItemLabel.TEXT,
             parent=parent,
             content_layer=content_layer,
         )
+    if comments is not None:
+        comments.attach(doc, item, [element])
 
 
 def _odf_element_text_lines(element: Any) -> list[str]:
@@ -754,7 +945,10 @@ def _odf_cell_is_rich(cell: Any) -> bool:
 
 
 def _image_ref_from_odf_image(
-    odf_obj: OdfDocument | None, image: Any
+    odf_obj: OdfDocument | None,
+    image: Any,
+    *,
+    image_loader: ImageResourceLoader | None = None,
 ) -> ImageRef | None:
     image_url = _odf_image_href(image)
     if not _odf_image_can_be_bitmap(image, image_url):
@@ -771,17 +965,17 @@ def _image_ref_from_odf_image(
         except Exception:
             image_data = None
 
-    if image_data is None and image_url:
-        image_path = Path(image_url)
-        if image_path.is_file():
-            image_data = image_path.read_bytes()
+    # External xlink:href values (remote URLs or local paths) are resolved through
+    # ImageResourceLoader, governed by enable_remote_fetch / enable_local_fetch.
+    if image_data is None and image_url and image_loader is not None:
+        image_data = image_loader.load_image_data(image_url, base_path=None)
 
     if image_data is None:
         return None
 
     pil_image = PILImage.open(BytesIO(image_data))
     pil_image.load()
-    return ImageRef.from_pil(image=pil_image, dpi=72)
+    return ImageRef.from_pil(image=normalize_image_for_png(pil_image), dpi=72)
 
 
 def _odf_image_href(image: Any) -> str | None:
@@ -801,8 +995,9 @@ def _odf_image_can_be_bitmap(image: Any, image_url: str | None) -> bool:
     suffix = Path(image_url).suffix.lower()
     if suffix in {".pdf", ".svg", ".emf", ".wmf"}:
         return False
+    # Empty suffix is intentionally excluded: extension-less paths are typical of
+    # system files (e.g. /etc/passwd) and are not valid ODF image references.
     return suffix in {
-        "",
         ".bmp",
         ".gif",
         ".jpeg",
@@ -839,6 +1034,7 @@ def _add_odf_images(
     content_layer: ContentLayer | None,
     odf_obj: OdfDocument | None,
     *,
+    image_loader: ImageResourceLoader | None = None,
     skip_object_replacements: bool = False,
 ) -> int:
     image_count = 0
@@ -848,7 +1044,11 @@ def _add_odf_images(
             if image_url.removeprefix("./").startswith("ObjectReplacements/"):
                 continue
         try:
-            image_ref = _image_ref_from_odf_image(odf_obj, image)
+            image_ref = _image_ref_from_odf_image(
+                odf_obj,
+                image,
+                image_loader=image_loader,
+            )
         except Exception as e:
             _log.debug("Could not extract OpenDocument image: %s", e)
             image_ref = None
@@ -866,6 +1066,8 @@ def _add_odf_child(
     parent: NodeItem | None,
     content_layer: ContentLayer | None,
     odf_obj: OdfDocument | None,
+    image_loader: ImageResourceLoader | None = None,
+    comments: _OdfComments | None = None,
 ) -> _OdfListState | None:
     if isinstance(element, Header):
         _add_odf_heading(
@@ -874,6 +1076,7 @@ def _add_odf_child(
             parent=parent,
             content_layer=content_layer,
             odf_obj=odf_obj,
+            comments=comments,
         )
     elif isinstance(element, Paragraph) and not isinstance(element, Header):
         _add_odf_paragraph(
@@ -882,6 +1085,8 @@ def _add_odf_child(
             parent=parent,
             content_layer=content_layer,
             odf_obj=odf_obj,
+            image_loader=image_loader,
+            comments=comments,
         )
     elif isinstance(element, OdfList):
         return _add_odf_list(
@@ -892,6 +1097,7 @@ def _add_odf_child(
             odf_obj=odf_obj,
             enumerated=False,
             flatten_nested_text=False,
+            comments=comments,
         )
     elif isinstance(element, OdfTable):
         _add_table_from_odf(
@@ -900,6 +1106,18 @@ def _add_odf_child(
             parent=parent,
             content_layer=content_layer,
             odf_obj=odf_obj,
+            image_loader=image_loader,
+            comments=comments,
+        )
+    elif isinstance(element, Section):
+        _add_odf_children(
+            doc,
+            element.children,
+            parent=parent,
+            content_layer=content_layer,
+            odf_obj=odf_obj,
+            image_loader=image_loader,
+            comments=comments,
         )
     elif isinstance(element, Frame):
         chart_count = _add_odf_charts(doc, element, parent, content_layer, odf_obj)
@@ -909,17 +1127,62 @@ def _add_odf_child(
             parent,
             content_layer,
             odf_obj,
+            image_loader=image_loader,
             skip_object_replacements=chart_count > 0,
         )
     else:
         get_images = getattr(element, "get_images", None)
         if callable(get_images):
-            _add_odf_images(doc, get_images(), parent, content_layer, odf_obj)
+            _add_odf_images(
+                doc,
+                get_images(),
+                parent,
+                content_layer,
+                odf_obj,
+                image_loader=image_loader,
+            )
         else:
             _log.debug(
                 "Ignoring ODF element with tag: %s", getattr(element, "tag", None)
             )
     return None
+
+
+def _add_odf_children(
+    doc: DoclingDocument,
+    elements: list[Any],
+    *,
+    parent: NodeItem | None,
+    content_layer: ContentLayer | None,
+    odf_obj: OdfDocument | None,
+    image_loader: ImageResourceLoader | None = None,
+    comments: _OdfComments | None = None,
+) -> None:
+    previous_list_state: _OdfListState | None = None
+    for element in elements:
+        if isinstance(element, OdfList):
+            previous_list_state = _add_odf_list(
+                doc,
+                element,
+                parent=parent,
+                content_layer=content_layer,
+                odf_obj=odf_obj,
+                enumerated=False,
+                continued_state=previous_list_state,
+                flatten_nested_text=False,
+                comments=comments,
+            )
+        else:
+            previous_list_state = None
+            _add_odf_child(
+                doc,
+                element,
+                parent=parent,
+                content_layer=content_layer,
+                odf_obj=odf_obj,
+                image_loader=image_loader,
+                comments=comments,
+            )
 
 
 def _embedded_odf_content_path(href: str) -> str:
@@ -940,9 +1203,18 @@ def _odf_chart_classification(chart_content: Any) -> PictureClassificationLabel:
     return PictureClassificationLabel.OTHER_CHART
 
 
+def _odf_chart_title(chart_content: Any) -> str | None:
+    """Read the chart object's own title, the way the PowerPoint backend emits one."""
+    for title in chart_content.get_elements("descendant::chart:title"):
+        text = title.text_content.strip()
+        if text:
+            return text
+    return None
+
+
 def _chart_data_from_frame(
     frame: Frame, odf_obj: OdfDocument | None
-) -> tuple[TableData, PictureClassificationLabel] | None:
+) -> tuple[TableData, PictureClassificationLabel, str | None] | None:
     if odf_obj is None:
         return None
 
@@ -956,14 +1228,21 @@ def _chart_data_from_frame(
 
     try:
         chart_content = odf_obj.get_part(_embedded_odf_content_path(object_href))
-    except Exception:
+        # odfdo resolves XML parts lazily, so a reference to a part that is missing
+        # from the package only fails once the part is actually read.
+        chart_classification = _odf_chart_classification(chart_content)
+        chart_tables = chart_content.get_elements("descendant::table:table")
+        chart_title = _odf_chart_title(chart_content)
+    except Exception as e:
+        _log.warning(
+            "Could not read embedded OpenDocument object %s: %s", object_href, e
+        )
         return None
-    chart_classification = _odf_chart_classification(chart_content)
-    for table in chart_content.get_elements("descendant::table:table"):
+    for table in chart_tables:
         if isinstance(table, OdfTable) and table.name == "local-table":
             table_data = _table_data_from_odf(table)
             if table_data is not None:
-                return table_data, chart_classification
+                return table_data, chart_classification, chart_title
     return None
 
 
@@ -989,8 +1268,23 @@ def _add_odf_charts(
         chart_result = _chart_data_from_frame(frame, odf_obj)
         if chart_result is None:
             continue
-        chart_data, chart_classification = chart_result
-        chart = doc.add_picture(parent=parent, content_layer=content_layer)
+        chart_data, chart_classification, chart_title = chart_result
+        # A chart's title is the caption of its picture, next to the data in the
+        # meta, the shape the PowerPoint/Word/Excel/iWork backends give a chart.
+        # A chart showing no title gets no caption; nothing is invented.
+        caption = (
+            doc.add_text(
+                label=DocItemLabel.CAPTION,
+                text=chart_title,
+                parent=parent,
+                content_layer=content_layer,
+            )
+            if chart_title
+            else None
+        )
+        chart = doc.add_picture(
+            parent=parent, content_layer=content_layer, caption=caption
+        )
         chart.label = DocItemLabel.PICTURE
         chart.meta = PictureMeta(
             classification=PictureClassificationMetaField(
@@ -998,7 +1292,9 @@ def _add_odf_charts(
                     PictureClassificationPrediction(class_name=chart_classification)
                 ]
             ),
-            tabular_chart=TabularChartMetaField(chart_data=chart_data),
+            tabular_chart=TabularChartMetaField(
+                chart_data=chart_data, title=chart_title
+            ),
         )
         chart_count += 1
     return chart_count
@@ -1014,6 +1310,7 @@ def _add_odf_list(
     level: int = 1,
     continued_state: _OdfListState | None = None,
     flatten_nested_text: bool = True,
+    comments: _OdfComments | None = None,
 ) -> _OdfListState | None:
     if not _odf_list_has_renderable_content(
         odf_list, flatten_nested_text=flatten_nested_text
@@ -1049,6 +1346,7 @@ def _add_odf_list(
                     enumerated=style_enumerated,
                     level=level + 1,
                     flatten_nested_text=flatten_nested_text,
+                    comments=comments,
                 )
         return None
 
@@ -1092,6 +1390,7 @@ def _add_odf_list(
                     enumerated=style_enumerated,
                     level=level + 1,
                     flatten_nested_text=flatten_nested_text,
+                    comments=comments,
                 )
             continue
         counter += 1
@@ -1110,9 +1409,13 @@ def _add_odf_list(
                 marker=marker,
                 enumerated=current_enumerated,
                 parent=list_group,
-                text=text,
+                # Prefer the run-derived text: odfdo's own text_recursive
+                # renders hyperlinked children as "[text](href)" markdown,
+                # which would otherwise leak into the plain item text.
+                text=runs[0].text if runs else text,
                 content_layer=content_layer,
                 formatting=runs[0].formatting if runs else None,
+                hyperlink=runs[0].hyperlink if runs else None,
             )
         else:
             item = doc.add_list_item(
@@ -1132,7 +1435,10 @@ def _add_odf_list(
                     text=run.text,
                     content_layer=content_layer,
                     formatting=run.formatting,
+                    hyperlink=run.hyperlink,
                 )
+        if comments is not None:
+            comments.attach(doc, item, child.get_elements("text:p | text:h"))
         previous_item = item
         for nested_list in nested:
             _add_odf_list(
@@ -1144,6 +1450,7 @@ def _add_odf_list(
                 enumerated=style_enumerated,
                 level=level + 1,
                 flatten_nested_text=flatten_nested_text,
+                comments=comments,
             )
     return _OdfListState(
         group=list_group,
@@ -1159,6 +1466,8 @@ def _add_rich_cell_children(
     parent: NodeItem,
     content_layer: ContentLayer | None,
     odf_obj: OdfDocument | None,
+    image_loader: ImageResourceLoader | None = None,
+    comments: _OdfComments | None = None,
 ) -> None:
     for child in cell.children:
         _add_odf_child(
@@ -1167,6 +1476,8 @@ def _add_rich_cell_children(
             parent=parent,
             content_layer=content_layer,
             odf_obj=odf_obj,
+            image_loader=image_loader,
+            comments=comments,
         )
 
 
@@ -1182,6 +1493,8 @@ def _add_table_from_odf(
     prov: ProvenanceItem | None = None,
     content_layer: ContentLayer | None = None,
     odf_obj: OdfDocument | None = None,
+    image_loader: ImageResourceLoader | None = None,
+    comments: _OdfComments | None = None,
 ) -> TableItem | None:
     if min_row is None or max_row is None or min_col is None or max_col is None:
         min_row, max_row, min_col, max_col = _find_true_data_bounds(table)
@@ -1211,8 +1524,13 @@ def _add_table_from_odf(
                 continue
 
             attrs = cell.attributes
-            row_span = int(attrs.get("table:number-rows-spanned") or 1)
-            col_span = int(attrs.get("table:number-columns-spanned") or 1)
+            # Keep merged ranges within the table region.
+            row_span = min(
+                _odf_span(attrs, "table:number-rows-spanned"), max_row - row_idx + 1
+            )
+            col_span = min(
+                _odf_span(attrs, "table:number-columns-spanned"), max_col - col_idx + 1
+            )
             adjusted_row = row_idx - min_row
             adjusted_col = col_idx - min_col
             text = _odf_cell_text(cell)
@@ -1241,10 +1559,16 @@ def _add_table_from_odf(
                     parent=group,
                     content_layer=content_layer,
                     odf_obj=odf_obj,
+                    image_loader=image_loader,
+                    comments=comments,
                 )
                 table_cell = RichTableCell(**cell_kwargs, ref=group.get_ref())
             else:
                 table_cell = TableCell(**cell_kwargs)
+                if comments is not None:
+                    comments.attach(
+                        doc, table_item, cell.get_elements("text:p | text:h")
+                    )
 
             doc.add_table_cell(table_item=table_item, cell=table_cell)
 
@@ -1318,8 +1642,13 @@ def _table_data_from_odf(
                 continue
 
             attrs = cell.attributes
-            row_span = int(attrs.get("table:number-rows-spanned") or 1)
-            col_span = int(attrs.get("table:number-columns-spanned") or 1)
+            # Keep merged ranges within the table region.
+            row_span = min(
+                _odf_span(attrs, "table:number-rows-spanned"), max_row - row_idx + 1
+            )
+            col_span = min(
+                _odf_span(attrs, "table:number-columns-spanned"), max_col - col_idx + 1
+            )
             text = _odf_cell_text(cell)
 
             # Adjust cell coordinates to be relative to the data region
@@ -1371,37 +1700,118 @@ class OdtDocumentBackend(_OdfBaseBackend):
                 f"Cannot convert doc with {self.document_hash} because the backend failed to init."
             )
 
-        self._walk(self.odf_obj.body.children, parent=None, doc=doc)
+        comments = self._detach_annotations()
+        self._walk(self.odf_obj.body.children, parent=None, doc=doc, comments=comments)
+        self._add_footnotes(doc, comments)
+        comments.attach_rest(doc)
         return doc
+
+    def _detach_annotations(self) -> _OdfComments:
+        """Remove the comments (``office:annotation``) from the body.
+
+        The text paths for paragraphs, headings, list items and table cells all
+        read an annotation's creator, date and body as inline text, so the
+        comment would otherwise be spliced into the text it annotates.
+
+        Returns the comments as threads: a comment, then its replies. Each entry
+        uses the '[author: Name (initials), time: date]: text' form of the DOCX
+        backend. A thread is keyed by the paragraph or heading around its first
+        comment.
+        """
+        body = self.odf_obj.body
+        # The walk drops deleted tracked-change text, so drop its comments too.
+        for annotation in body.get_elements(
+            "descendant::text:tracked-changes//office:annotation"
+        ):
+            Element.delete(annotation)
+        comments: list[tuple[str | None, str | None, str]] = []
+        anchors: list[Element | None] = []
+        for annotation in body.get_elements("descendant::office:annotation"):
+            anchor = annotation.parent
+            while anchor is not None and anchor.tag not in ("text:p", "text:h"):
+                anchor = anchor.parent
+            metadata: list[str] = []
+            creator = annotation.get_element("dc:creator")
+            if creator is not None and creator.text:
+                author = f"author: {creator.text}"
+                # LibreOffice writes loext:sender-initials for ODF 1.2.
+                initials = annotation.get_element(
+                    "meta:creator-initials | loext:sender-initials"
+                )
+                if initials is not None and initials.text:
+                    author += f" ({initials.text})"
+                metadata.append(author)
+            date = annotation.get_element("dc:date")
+            if date is not None and date.text:
+                metadata.append(f"time: {date.text}")
+            prefix = ", ".join(metadata)
+            text = annotation.text_content.strip()
+            name = annotation.attributes.get("office:name")
+            parent_name = annotation.attributes.get("loext:parent-name")
+            # Not Annotation.delete(): it searches the whole body for the
+            # matching office:annotation-end, once per comment.
+            Element.delete(annotation)
+
+            if prefix and text:
+                comment = f"[{prefix}]: {text}"
+            elif prefix:
+                comment = f"[{prefix}]"
+            elif text:
+                comment = text
+            else:
+                continue
+            comments.append((name, parent_name, comment))
+            anchors.append(anchor)
+
+        # LibreOffice links a reply to the comment it answers by name. A reply
+        # can come before that comment, so build the threads after the pass.
+        # As in the XLSX backend, each comment comes before its replies.
+        index_by_name: dict[str, int] = {}
+        for index, (name, _, _) in enumerate(comments):
+            if name:
+                index_by_name.setdefault(name, index)
+        roots: list[int] = []
+        replies: dict[int, list[int]] = {}
+        for index, (_, parent_name, _) in enumerate(comments):
+            parent = index_by_name.get(parent_name) if parent_name else None
+            if parent is None or parent == index:
+                roots.append(index)
+            else:
+                replies.setdefault(parent, []).append(index)
+        threads: list[tuple[Element | None, list[str]]] = []
+        visited: set[int] = set()
+        # A parent-name cycle has no root, so its first comment starts a thread.
+        for start in [*roots, *range(len(comments))]:
+            if start in visited:
+                continue
+            thread: list[str] = []
+            stack = [start]
+            while stack:
+                index = stack.pop()
+                if index in visited:
+                    continue
+                visited.add(index)
+                thread.append(comments[index][2])
+                stack.extend(reversed(replies.get(index, [])))
+            threads.append((anchors[start], thread))
+        return _OdfComments(threads)
 
     def _walk(
         self,
         elements: list[Any],
         parent: NodeItem | None,
         doc: DoclingDocument,
+        comments: _OdfComments,
     ) -> None:
-        previous_list_state: _OdfListState | None = None
-        for el in elements:
-            if isinstance(el, OdfList):
-                previous_list_state = _add_odf_list(
-                    doc,
-                    el,
-                    parent=parent,
-                    content_layer=None,
-                    odf_obj=self.odf_obj,
-                    enumerated=False,
-                    continued_state=previous_list_state,
-                    flatten_nested_text=False,
-                )
-            else:
-                previous_list_state = None
-                _add_odf_child(
-                    doc,
-                    el,
-                    parent=parent,
-                    odf_obj=self.odf_obj,
-                    content_layer=None,
-                )
+        _add_odf_children(
+            doc,
+            elements,
+            parent=parent,
+            content_layer=None,
+            odf_obj=self.odf_obj,
+            image_loader=self._image_loader,
+            comments=comments,
+        )
 
 
 class OdpDocumentBackend(_OdfBaseBackend, PaginatedDocumentBackend):
@@ -1438,7 +1848,10 @@ class OdpDocumentBackend(_OdfBaseBackend, PaginatedDocumentBackend):
                 f"Cannot convert doc with {self.document_hash} because the backend failed to init."
             )
 
+        start_page, end_page = self.page_range
         for slide_idx, page in enumerate(self.odf_obj.body.get_draw_pages()):
+            if not start_page <= slide_idx + 1 <= end_page:
+                continue
             slide_name = page.name or f"slide-{slide_idx + 1}"
             slide_group = doc.add_group(
                 name=f"slide-{slide_idx}",
@@ -1527,6 +1940,7 @@ class OdpDocumentBackend(_OdfBaseBackend, PaginatedDocumentBackend):
                 tbl,
                 parent=parent,
                 odf_obj=self.odf_obj,
+                image_loader=self._image_loader,
             )
 
         _add_odf_images(
@@ -1535,6 +1949,7 @@ class OdpDocumentBackend(_OdfBaseBackend, PaginatedDocumentBackend):
             parent,
             None,
             self.odf_obj,
+            image_loader=self._image_loader,
             skip_object_replacements=chart_count > 0,
         )
 
@@ -1651,14 +2066,24 @@ class OdsDocumentBackend(_OdfBaseBackend, PaginatedDocumentBackend):
             else None
         )
 
+        start_page, end_page = self.page_range
         page_no = 0
         for sheet_idx, table in enumerate(self.odf_obj.body.tables):
             if sheet_names_filter is not None and table.name not in sheet_names_filter:
                 _log.debug(f"Skipping sheet {sheet_idx}: {table.name} (filtered out)")
                 continue
 
+            # Page numbers are positions within the filtered sheets, as in XLSX.
             page_no += 1
+            if not start_page <= page_no <= end_page:
+                continue
             _log.info(f"Processing sheet {sheet_idx}: {table.name} as page {page_no}")
+
+            # LibreOffice pads sheets towards its full grid (16,384 columns and
+            # 1,048,576 rows) with repeated empty cells and rows that only carry a
+            # style. odfdo expands each repetition when it traverses the sheet, so
+            # remove the trailing padding first. Cells with content are kept.
+            table.rstrip(aggressive=True)
 
             # Add page for this sheet
             page = doc.add_page(page_no=page_no, size=Size(width=0, height=0))

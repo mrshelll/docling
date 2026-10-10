@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 import csv
 import json
 import logging
@@ -30,6 +33,7 @@ from docling_core.types.doc import (
     DoclingDocument,
     PictureItem,
     SectionHeaderItem,
+    Size,
     TableItem,
     TextItem,
 )
@@ -126,13 +130,13 @@ class InputDocument(BaseModel):
     """A document as an input of a Docling conversion."""
 
     file: Annotated[
-        PurePath, Field(description="A path representation the input document.")
+        PurePath, Field(description="A path representation of the input document.")
     ]
     document_hash: Annotated[
         str,
         Field(description="A stable hash of the path or stream of the input document."),
     ]
-    valid: bool = Field(True, description="Whether this is is a valid input document.")
+    valid: bool = Field(True, description="Whether this is a valid input document.")
     backend_options: Optional[BackendOptions] = Field(
         None, description="Custom options for backends."
     )
@@ -592,6 +596,11 @@ class ConversionResult(ConversionAssets):
     # Private transient plumbing: a Pydantic private attr (not a model field, never serialized);
     # the heading stage resets it to None once consumed.
     _pdf_outline: Optional[list[_PdfOutlineItem]] = PrivateAttr(default=None)
+    # Page sizes recorded while the PDF pipeline produces pages, so that pages which
+    # fail later can still be added to the document with their real size. Kept on the
+    # conversion result (not on the pipeline) because one pipeline instance is shared
+    # by every conversion made through the same DocumentConverter.
+    _page_sizes_by_no: dict[int, Size] = PrivateAttr(default_factory=dict)
 
 
 class _DummyBackend(AbstractDocumentBackend):
@@ -611,6 +620,24 @@ class _DummyBackend(AbstractDocumentBackend):
 
     def unload(self):
         return super().unload()
+
+
+_OFFICE_OPEN_XML_ROOT = "application/vnd.openxmlformats-officedocument"
+
+_ZIP_SUFFIX_MIMETYPES = {
+    ".xlsx": _OFFICE_OPEN_XML_ROOT + ".spreadsheetml.sheet",
+    ".docx": _OFFICE_OPEN_XML_ROOT + ".wordprocessingml.document",
+    ".pptx": _OFFICE_OPEN_XML_ROOT + ".presentationml.presentation",
+    ".pages": FormatToMimeType[InputFormat.IWORK_PAGES][0],
+    ".numbers": FormatToMimeType[InputFormat.IWORK_NUMBERS][0],
+    ".key": FormatToMimeType[InputFormat.IWORK_KEYNOTE][0],
+}
+"""Formats that are ZIP containers, by the extension that tells them apart.
+
+``filetype`` can only see the ZIP, so a member of this family is identified by
+its name and confirmed no further; anything else that arrives as a ZIP is looked
+at inside instead.
+"""
 
 
 class _DocumentConversionInput(BaseModel):
@@ -771,25 +798,27 @@ class _DocumentConversionInput(BaseModel):
             if _DocumentConversionInput._has_dclx_extension(obj.name):
                 return InputFormat.DCLX
             mime = filetype.guess_mime(str(obj))
-            obj_ext = obj.suffix[1:] if obj.suffix else ""
+            # Lower-cased so that an upper-case extension (NOTES.VTT, page.HTML)
+            # maps to its format the same way it does for a DocumentStream.
+            obj_ext = obj.suffix[1:].lower() if obj.suffix else ""
             if mime is None:
                 mime = _DocumentConversionInput._mime_from_extension(obj_ext)
             needs_content_sniff = mime is None or (
                 mime is not None
-                and mime.lower() in {"application/xml", "application/xhtml+xml"}
+                and mime.lower()
+                in {
+                    "application/octet-stream",
+                    "application/xml",
+                    "application/xhtml+xml",
+                }
             )
             if needs_content_sniff:
                 with obj.open("rb") as f:
                     content = f.read(1024)
             if mime is not None and mime.lower() == "application/zip":
-                mime_root = "application/vnd.openxmlformats-officedocument"
-                suffix = obj.suffix.lower()
-                if suffix == ".xlsx":
-                    mime = mime_root + ".spreadsheetml.sheet"
-                elif suffix == ".docx":
-                    mime = mime_root + ".wordprocessingml.document"
-                elif suffix == ".pptx":
-                    mime = mime_root + ".presentationml.presentation"
+                named = _ZIP_SUFFIX_MIMETYPES.get(obj.suffix.lower())
+                if named is not None:
+                    mime = named
                 else:
                     office_mime = _DocumentConversionInput._detect_office_mime_from_zip(
                         obj
@@ -813,14 +842,16 @@ class _DocumentConversionInput(BaseModel):
             if mime is None:
                 mime = _DocumentConversionInput._mime_from_extension(obj_ext.lower())
             if mime is not None and mime.lower() == "application/zip":
-                objname = obj.name.lower()
-                mime_root = "application/vnd.openxmlformats-officedocument"
-                if objname.endswith(".xlsx"):
-                    mime = mime_root + ".spreadsheetml.sheet"
-                elif objname.endswith(".docx"):
-                    mime = mime_root + ".wordprocessingml.document"
-                elif objname.endswith(".pptx"):
-                    mime = mime_root + ".presentationml.presentation"
+                named = next(
+                    (
+                        named
+                        for suffix, named in _ZIP_SUFFIX_MIMETYPES.items()
+                        if obj.name.lower().endswith(suffix)
+                    ),
+                    None,
+                )
+                if named is not None:
+                    mime = named
                 else:
                     office_mime = _DocumentConversionInput._detect_office_mime_from_zip(
                         obj.stream
@@ -828,11 +859,17 @@ class _DocumentConversionInput(BaseModel):
                     if office_mime is not None:
                         mime = office_mime
 
+        mime = _DocumentConversionInput._resolve_ole2_mime(mime, obj_ext)
+
         if mime is not None and mime.lower() == "application/gzip":
             if detected_mime := _DocumentConversionInput._detect_mets_gbs(obj):
                 mime = detected_mime
 
+        if not mime or mime.lower() == "application/octet-stream":
+            if detected_afp := _DocumentConversionInput._detect_afp(content):
+                mime = detected_afp
         mime = mime or _DocumentConversionInput._detect_html_xhtml(content)
+        mime = mime or _DocumentConversionInput._detect_latex(content, obj_ext)
         mime = mime or _DocumentConversionInput._detect_csv(content)
         mime = mime or "text/plain"
         formats = MimeTypeToFormat.get(mime, [])
@@ -847,6 +884,25 @@ class _DocumentConversionInput(BaseModel):
                 )
         else:
             return None
+
+    @staticmethod
+    def _resolve_ole2_mime(mime: Optional[str], ext: Optional[str]) -> Optional[str]:
+        """Let the extension choose between the OLE2 based legacy Office formats.
+
+        ``filetype`` tells .doc, .ppt and .xls apart from a few bytes after the
+        OLE2 header, which is not conclusive: a file whose first sector is a FAT
+        sector is reported as Excel (or PowerPoint) whatever it really holds.
+        """
+        if mime is None or ext is None:
+            return mime
+        ole2_formats = (InputFormat.DOC, InputFormat.PPT, InputFormat.XLS)
+        ole2_mimes = {m for fmt in ole2_formats for m in FormatToMimeType[fmt]}
+        if mime.lower() not in ole2_mimes:
+            return mime
+        for fmt in ole2_formats:
+            if ext.lower() in FormatToExtensions[fmt]:
+                return FormatToMimeType[fmt][0]
+        return mime
 
     @staticmethod
     def _has_doclang_extension(name: str) -> bool:
@@ -907,7 +963,12 @@ class _DocumentConversionInput(BaseModel):
         input_format: Optional[InputFormat] = None
 
         if mime in {"application/xml", "application/xhtml+xml"}:
-            content_str = content.decode("utf-8")
+            # ``content`` is a truncated head of the document (see _guess_format),
+            # so it can end mid-codepoint even for well-formed UTF-8, and an XML
+            # document may legitimately declare a non-UTF-8 encoding. Every marker
+            # matched below is ASCII, so replacing undecodable bytes cannot change
+            # the outcome -- while a strict decode would abort the whole batch.
+            content_str = content.decode("utf-8", errors="replace")
 
             if (
                 InputFormat.XML_XBRL in formats
@@ -968,6 +1029,8 @@ class _DocumentConversionInput(BaseModel):
             mime = FormatToMimeType[InputFormat.ASCIIDOC][0]
         elif ext in FormatToExtensions[InputFormat.HTML]:
             mime = FormatToMimeType[InputFormat.HTML][0]
+        elif ext in FormatToExtensions[InputFormat.MHTML]:
+            mime = FormatToMimeType[InputFormat.MHTML][0]
         elif ext in FormatToExtensions[InputFormat.XML_USPTO]:
             # USPTO text files share the "txt" extension with Markdown. Leave mime=None
             # so content probing can distinguish PATN text from plain Markdown text.
@@ -980,12 +1043,18 @@ class _DocumentConversionInput(BaseModel):
             mime = FormatToMimeType[InputFormat.JSON_DOCLING][0]
         elif ext in FormatToExtensions[InputFormat.BOXNOTE]:
             mime = FormatToMimeType[InputFormat.BOXNOTE][0]
+        elif ext in FormatToExtensions[InputFormat.EBCDIC]:
+            mime = FormatToMimeType[InputFormat.EBCDIC][0]
+        elif ext in FormatToExtensions[InputFormat.AFP]:
+            mime = FormatToMimeType[InputFormat.AFP][0]
         elif ext in FormatToExtensions[InputFormat.PDF]:
             mime = FormatToMimeType[InputFormat.PDF][0]
         elif ext in FormatToExtensions[InputFormat.DOCX]:
             mime = FormatToMimeType[InputFormat.DOCX][0]
         elif ext in FormatToExtensions[InputFormat.DOC]:
             mime = FormatToMimeType[InputFormat.DOC][0]
+        elif ext in FormatToExtensions[InputFormat.RTF]:
+            mime = FormatToMimeType[InputFormat.RTF][0]
         elif ext in FormatToExtensions[InputFormat.PPTX]:
             mime = FormatToMimeType[InputFormat.PPTX][0]
         elif ext in FormatToExtensions[InputFormat.PPT]:
@@ -1005,8 +1074,27 @@ class _DocumentConversionInput(BaseModel):
         elif ext in FormatToExtensions[InputFormat.LATEX]:
             mime = FormatToMimeType[InputFormat.LATEX][0]
         elif ext in FormatToExtensions[InputFormat.EMAIL]:
-            mime = FormatToMimeType[InputFormat.EMAIL][0]
+            mime = (
+                "application/vnd.ms-outlook"
+                if ext == "msg"
+                else FormatToMimeType[InputFormat.EMAIL][0]
+            )
         return mime
+
+    @staticmethod
+    def _detect_afp(content: bytes) -> Optional[str]:
+        """Detect an AFP MO:DCA structured-field introducer.
+
+        The two-byte length excludes the leading X'5A' carriage-control byte and
+        includes the eight-byte structured-field introducer. Only the header is
+        required here because format sniffing reads a bounded prefix of the file.
+        """
+        if len(content) < 9 or content[0] != 0x5A:
+            return None
+        field_length = int.from_bytes(content[1:3], byteorder="big")
+        if not 8 <= field_length <= 32767 or content[3] != 0xD3:
+            return None
+        return FormatToMimeType[InputFormat.AFP][0]
 
     @staticmethod
     def _detect_html_xhtml(
@@ -1050,6 +1138,26 @@ class _DocumentConversionInput(BaseModel):
         ):
             return "application/xml"
 
+        return None
+
+    @staticmethod
+    def _detect_latex(content: bytes, ext: Optional[str] = None) -> Optional[str]:
+        """Guess the mime type of a LaTeX document from its content.
+
+        Args:
+            content: A short piece of a document from its beginning.
+            ext: The file extension, if any. A plain-text extension keeps its
+              Markdown fallback even when the text quotes LaTeX.
+
+        Returns:
+            The LaTeX mime type if a line starts with ``\\documentclass`` (or
+              LaTeX 2.09 ``\\documentstyle``), or None.
+        """
+        if (ext or "").lower() in FormatToExtensions[InputFormat.MD]:
+            return None
+        content_str = content.decode("utf-8", errors="ignore").lstrip("﻿")
+        if re.search(r"^[ \t]*\\document(?:class|style)\b", content_str, re.MULTILINE):
+            return FormatToMimeType[InputFormat.LATEX][0]
         return None
 
     @staticmethod
@@ -1101,7 +1209,8 @@ class _DocumentConversionInput(BaseModel):
                 fileobj=content if isinstance(content, BytesIO) else None,
                 mode="r:gz",
             ) as tar:
-                for member in tar.getmembers():
+                # Iterate lazily so the member limit applies before all headers are read
+                for member in tar:
                     member_count += 1
                     if member_count > max_member_count:
                         _log.warning(
@@ -1125,5 +1234,8 @@ class _DocumentConversionInput(BaseModel):
         except Exception as e:
             _log.warning(f"Error during METS-GBS format detection: {e}")
             return None
+        finally:
+            if isinstance(content, BytesIO):
+                content.seek(0)
 
         return None

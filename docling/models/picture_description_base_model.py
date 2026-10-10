@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 from abc import abstractmethod
 from collections.abc import Iterable
 from pathlib import Path
@@ -55,7 +58,11 @@ class PictureDescriptionBaseModel(
         self.images_scale = options.scale
 
     def is_processable(self, doc: DoclingDocument, element: NodeItem) -> bool:
-        return self.enabled and isinstance(element, PictureItem)
+        return (
+            self.enabled
+            and isinstance(element, PictureItem)
+            and (element.meta is None or element.meta.description is None)
+        )
 
     def _annotate_images(
         self, images: Iterable[Image.Image]

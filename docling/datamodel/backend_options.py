@@ -1,7 +1,24 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
+from enum import Enum
 from pathlib import Path, PurePath
 from typing import Annotated, Literal, Optional, Union
+from urllib.parse import urlparse
 
-from pydantic import AnyUrl, BaseModel, Field, PositiveInt, SecretStr, conint
+from pydantic import (
+    AnyUrl,
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    PrivateAttr,
+    SecretStr,
+    conint,
+    field_validator,
+    model_validator,
+)
 
 
 class BaseBackendOptions(BaseModel):
@@ -19,6 +36,50 @@ class DeclarativeBackendOptions(BaseBackendOptions):
     """Default backend options for a declarative document backend."""
 
     kind: Literal["declarative"] = Field("declarative", exclude=True, repr=False)
+
+
+class TextBackendOptions(BaseBackendOptions):
+    """Options common to the backends that decode a whole file as plain text."""
+
+    encoding: Optional[str] = Field(
+        None,
+        description=(
+            "Character encoding of the document, as a Python codec name such as "
+            '"shift_jis" or "koi8-r". When set, the file is decoded with it and '
+            "nothing is guessed. When unset, a byte-order mark is honoured, then "
+            "UTF-8 is tried, then cp1252; anything else raises."
+        ),
+    )
+
+
+class CsvBackendOptions(TextBackendOptions):
+    """Options specific to the CSV backend."""
+
+    kind: Literal["csv"] = Field("csv", exclude=True, repr=False)
+
+
+class AsciiDocBackendOptions(TextBackendOptions):
+    """Options specific to the AsciiDoc backend."""
+
+    kind: Literal["asciidoc"] = Field("asciidoc", exclude=True, repr=False)
+    fetch_images: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether the backend should access remote or local resources to parse "
+                "images in the AsciiDoc document."
+            )
+        ),
+    ] = False
+    source_uri: Annotated[
+        AnyUrl | PurePath | None,
+        Field(
+            description=(
+                "The URI that originates the AsciiDoc document. If provided, the backend "
+                "will use it to resolve relative image paths."
+            ),
+        ),
+    ] = None
 
 
 class HTMLBackendOptions(BaseBackendOptions):
@@ -90,10 +151,25 @@ class HTMLBackendOptions(BaseBackendOptions):
             description=(
                 "HTTP headers to include when fetching remote images. Use for "
                 "authentication (e.g., API keys, bearer tokens) or custom headers "
-                "required by image servers."
+                "required by image servers. They are only sent to the origins in "
+                "`headers_allowed_origins`, and are dropped on redirects to other "
+                "origins."
             ),
             examples=[{"Authorization": "Bearer TOKEN"}, {"X-API-Key": "your-api-key"}],
             repr=False,
+        ),
+    ] = None
+    headers_allowed_origins: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Origins (scheme, host and optional port, e.g. "
+                "`https://cdn.example.com`) that receive `headers`. When None, "
+                "headers are only sent to the origin of the source document "
+                "(`source_uri`); for local files and streams without a remote "
+                "`source_uri` they are then not sent at all."
+            ),
+            examples=[["https://example.com", "https://cdn.example.com:8443"]],
         ),
     ] = None
     add_title: bool = Field(
@@ -115,8 +191,20 @@ class HTMLBackendOptions(BaseBackendOptions):
         description="Maximum number of HTTP redirects to follow when fetching remote resources. Set to 0 to disable redirects.",
     )
 
+    @field_validator("headers_allowed_origins")
+    @classmethod
+    def _check_origins(cls, value: list[str] | None) -> list[str] | None:
+        for origin in value or []:
+            parsed = urlparse(origin)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError(
+                    f"Invalid origin {origin!r}: expected an http(s) URL such as "
+                    "'https://cdn.example.com'"
+                )
+        return value
 
-class MarkdownBackendOptions(BaseBackendOptions):
+
+class MarkdownBackendOptions(TextBackendOptions):
     """Options specific to the Markdown backend."""
 
     kind: Literal["md"] = Field("md", exclude=True, repr=False)
@@ -137,6 +225,26 @@ class MarkdownBackendOptions(BaseBackendOptions):
     max_image_data_base64_bytes: PositiveInt = Field(
         20 * 1024 * 1024,  # 20 MB
         description="The maximum number of base64 data bytes that the backend will accept.",
+    )
+
+
+class JatsBackendOptions(BaseBackendOptions):
+    """Options specific to the JATS XML backend."""
+
+    kind: Literal["xml_jats"] = Field("xml_jats", exclude=True, repr=False)
+    fetch_images: bool = Field(
+        False,
+        description=(
+            "Whether the backend should access local resources to parse figure "
+            "images in a JATS document."
+        ),
+    )
+    source_uri: Optional[Union[AnyUrl, PurePath]] = Field(
+        None,
+        description=(
+            "The URI that originates the JATS document. If provided, the backend "
+            "will use it to resolve relative figure paths."
+        ),
     )
 
 
@@ -167,6 +275,8 @@ class EpubBackendOptions(BaseBackendOptions):
 class PdfBackendOptions(BaseBackendOptions):
     """Backend options for pdf document backends."""
 
+    _materialize_char_cells: bool = PrivateAttr(default=False)
+
     kind: Literal["pdf"] = Field("pdf", exclude=True, repr=False)
     password: Optional[SecretStr] = None
     enforce_same_font: bool = Field(
@@ -175,6 +285,15 @@ class PdfBackendOptions(BaseBackendOptions):
             "Whether docling-parse should split text cells at font boundaries. "
             "Disable this when PDFs use separate fonts for base glyphs and "
             "diacritics that should remain in the same text cell."
+        ),
+    )
+    include_bitmap_images: bool = Field(
+        False,
+        description=(
+            "Whether docling-parse should decode the bytes of the bitmap images "
+            "embedded in the page, in addition to their bounding boxes. Needed to "
+            "extract native picture images (e.g. by the native PDF pipeline); "
+            "decoding costs time and memory, so it is off by default."
         ),
     )
 
@@ -190,6 +309,22 @@ class ThreadedDoclingParseBackendOptions(PdfBackendOptions):
         description=(
             "Number of parser threads to use for the threaded docling-parse backend. "
             "If unset, the backend falls back to global accelerator thread settings."
+        ),
+    )
+    render_pages: bool = Field(
+        True,
+        description=(
+            "Whether the parser should also render a page image while decoding a page. "
+            "Rendering is what makes page images available; turn it off to parse the "
+            "text and image content only, at which point requesting a page image fails."
+        ),
+    )
+    render_scale: PositiveFloat = Field(
+        1.0,
+        description=(
+            "Raster scale in pixels per point of the page image rendered while decoding "
+            "(1.0 renders at 72 DPI, 2.0 at 144 DPI). Set it to the scale the page images "
+            "are consumed at, so pages are not rendered a second time on request."
         ),
     )
     release_native_memory_every_n_pages: conint(ge=0) = Field(
@@ -221,6 +356,58 @@ class MetsGbsBackendOptions(PdfBackendOptions):
     max_member_count: Annotated[
         PositiveInt, Field(description="Maximum number of archive members to process")
     ] = 1000
+
+
+class IWorkBackendOptions(BaseBackendOptions):
+    """Options specific to the Apple iWork document backends."""
+
+    kind: Annotated[Literal["iwork"], Field(exclude=True, repr=False)] = "iwork"
+    max_total_bytes: Annotated[
+        PositiveInt,
+        Field(
+            description="Maximum cumulative size in bytes of all data read from the iWork archive during processing"
+        ),
+    ] = 300 * 1024 * 1024
+    max_file_bytes: Annotated[
+        PositiveInt,
+        Field(
+            description="Maximum size in bytes for any single member read from the iWork archive"
+        ),
+    ] = 100 * 1024 * 1024
+    max_member_count: Annotated[
+        PositiveInt, Field(description="Maximum number of archive members to inspect")
+    ] = 5000
+    sheet_names: Annotated[
+        Optional[list[str]],
+        Field(
+            description=(
+                "An optional list of sheet names to include when converting a "
+                "Numbers spreadsheet. When set, only sheets whose names appear "
+                "in this list will be processed. Sheet names are matched "
+                "case-sensitively. Set to None (default) to include all sheets. "
+                "Ignored by the Pages backend, which has no sheets."
+            )
+        ),
+    ] = None
+    render_chart_images: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether to render an image for each chart in a Keynote "
+                "presentation or a Numbers spreadsheet and attach it to the "
+                "chart PictureItem. Neither app stores a picture of a chart, so "
+                "the chart is rebuilt from the data read out of the document as "
+                "a single-chart Office document and "
+                "rasterized with LibreOffice, the route the Office backends "
+                "render their charts by. The image has the chart's kind, data "
+                "and title but not its colours or fonts, and a chart with no "
+                "Office equivalent (mixed, two-axis, bubble or interactive) "
+                "gets none. Opt-in (default False) because it requires "
+                "LibreOffice and inflates the output size. Charts always keep "
+                "their classification and data regardless of this option."
+            )
+        ),
+    ] = False
 
 
 class MsExcelBackendOptions(BaseBackendOptions):
@@ -312,6 +499,20 @@ class MsWordBackendOptions(BaseBackendOptions):
         ),
     )
 
+    use_outline_level_for_headings: Annotated[
+        bool,
+        Field(
+            description=(
+                "Use `w:outlineLvl` as a heading signal when no name-based signal "
+                "exists (e.g. localized styles such as `Nadpis1`). Known limitation: "
+                "styles that carry an outline level only for TOC participation are "
+                "also promoted to headings. Set to `False` to disable. Note: for "
+                "styles already identified as headings by name, the level is still "
+                "read from `w:outlineLvl` regardless of this option."
+            )
+        ),
+    ] = True
+
 
 class OdsBackendOptions(BaseBackendOptions):
     """Options specific to the ODS (OpenDocument Spreadsheet) backend."""
@@ -352,6 +553,14 @@ class LatexBackendOptions(BaseBackendOptions):
     """Options specific to the LaTeX backend."""
 
     kind: Literal["latex"] = Field("latex", exclude=True, repr=False)
+    source_uri: Optional[PurePath] = Field(
+        None,
+        description=(
+            "The local path of the LaTeX document. If provided and the document "
+            "is read from a stream, the backend resolves relative \\input, "
+            "\\include and \\includegraphics paths against its directory."
+        ),
+    )
     parse_timeout: Optional[float] = Field(
         30.0,
         description=(
@@ -363,7 +572,12 @@ class LatexBackendOptions(BaseBackendOptions):
         None,
         description=(
             "The engine to use for rendering Tikz diagrams into images. "
-            "Set to 'tectonic' to enable asynchronous image generation."
+            "Set to 'tectonic' to enable asynchronous image generation. "
+            "Without shell escape, Tectonic runs with --untrusted and "
+            "--only-cached, and diagrams whose source names absolute or "
+            "parent-directory files are kept as TikZ code instead of rendered. "
+            "This check is best-effort: process untrusted LaTeX in an isolated "
+            "environment."
         ),
     )
     tikz_engine_timeout: float = Field(
@@ -375,7 +589,22 @@ class LatexBackendOptions(BaseBackendOptions):
         description=(
             "Allow Tectonic TikZ rendering to enable shell escape during "
             "compilation. Disabled by default for safer rendering of untrusted "
-            "LaTeX."
+            "LaTeX; enable only for trusted input."
+        ),
+    )
+
+
+class EmailBackendOptions(BaseBackendOptions):
+    """Options specific to the email backend (``.eml`` and ``.msg``)."""
+
+    kind: Literal["email"] = Field("email", exclude=True, repr=False)
+    list_attachments: bool = Field(
+        False,
+        description=(
+            "Whether to append a list of the email's attachment filenames to "
+            "the converted document. Only the attachment names (and content "
+            "types when available) are listed; the attachments' binary content "
+            "is never embedded. Opt-in (default False)."
         ),
     )
 
@@ -399,20 +628,212 @@ class XBRLBackendOptions(BaseBackendOptions):
     ] = None
 
 
+class EbcdicFieldType(str, Enum):
+    """Storage type of a field inside an EBCDIC record.
+
+    The names map to the COBOL usages found in a copybook: `string` is
+    `USAGE DISPLAY` character data, `integer`/`unsigned_integer` are
+    `COMP`/`BINARY`, `packed_decimal` is `COMP-3`, and `zoned_decimal` is
+    signed `USAGE DISPLAY` numeric data. `skip` covers fillers whose bytes
+    are consumed but never decoded.
+    """
+
+    STRING = "string"
+    INTEGER = "integer"
+    UNSIGNED_INTEGER = "unsigned_integer"
+    PACKED_DECIMAL = "packed_decimal"
+    ZONED_DECIMAL = "zoned_decimal"
+    SKIP = "skip"
+
+
+class EbcdicField(BaseModel):
+    """A single fixed-width field of an EBCDIC record."""
+
+    name: Annotated[str, Field(description="Column name of the decoded field.")]
+    size: Annotated[PositiveInt, Field(description="Field width in bytes.")]
+    type: Annotated[
+        EbcdicFieldType, Field(description="How the bytes are decoded.")
+    ] = EbcdicFieldType.STRING
+    scale: Annotated[
+        NonNegativeInt,
+        Field(
+            description=(
+                "Number of implied decimal digits of a numeric field, i.e. the "
+                "digits after `V` in the COBOL picture clause."
+            )
+        ),
+    ] = 0
+
+
+class EbcdicRecordLayout(BaseModel):
+    """Field layout of one record schema, i.e. a single COBOL copybook."""
+
+    fields: Annotated[
+        list[EbcdicField],
+        Field(min_length=1, description="Fields in physical record order."),
+    ]
+    name: Annotated[
+        str, Field(description="Name of the schema, used as the table heading.")
+    ] = "record"
+    selector: Annotated[
+        Optional[str],
+        Field(
+            description=(
+                "Value of the record-type prefix that selects this schema. "
+                "Required as soon as a layout defines more than one schema."
+            )
+        ),
+    ] = None
+
+    @property
+    def size(self) -> int:
+        """Length in bytes of a record following this layout."""
+        return sum(item.size for item in self.fields)
+
+
+class EbcdicLayout(BaseModel):
+    """Parsing rules for an EBCDIC data file.
+
+    A layout describes the bytes to ignore at the file boundaries, the optional
+    prefix carried by every record, and the record schemas themselves. Records
+    are fixed-length unless `record_length_field` declares a length prefix.
+    """
+
+    records: Annotated[
+        list[EbcdicRecordLayout],
+        Field(min_length=1, description="Record schemas present in the file."),
+    ]
+    description: Annotated[
+        str, Field(description="Free-text description of the layout.")
+    ] = ""
+    header_size: Annotated[
+        NonNegativeInt, Field(description="Bytes to skip at the start of the file.")
+    ] = 0
+    footer_size: Annotated[
+        NonNegativeInt, Field(description="Bytes to skip at the end of the file.")
+    ] = 0
+    record_length_field: Annotated[
+        Optional[EbcdicField],
+        Field(
+            description=(
+                "Prefix field holding the total record length, prefix included. "
+                "Set it for variable-length records; leave it unset when every "
+                "record has the fixed size of its schema."
+            )
+        ),
+    ] = None
+    record_type_field: Annotated[
+        Optional[EbcdicField],
+        Field(
+            description=(
+                "Prefix field whose value selects the record schema. Required "
+                "for multi-schema files."
+            )
+        ),
+    ] = None
+
+    @property
+    def prefix_fields(self) -> list[EbcdicField]:
+        """Prefix fields read ahead of every record, in physical order."""
+        return [
+            item
+            for item in (self.record_length_field, self.record_type_field)
+            if item is not None
+        ]
+
+    @property
+    def prefix_size(self) -> int:
+        """Length in bytes of the prefix read ahead of every record."""
+        return sum(item.size for item in self.prefix_fields)
+
+    def select(self, record_type: Optional[str]) -> Optional[EbcdicRecordLayout]:
+        """Return the schema matching a record-type value, if any."""
+        if self.record_type_field is None:
+            return self.records[0]
+        return next(
+            (item for item in self.records if item.selector == record_type), None
+        )
+
+    @model_validator(mode="after")
+    def _validate_records(self) -> "EbcdicLayout":
+        if len(self.records) > 1 and self.record_type_field is None:
+            raise ValueError(
+                "record_type_field is required for a layout with several records"
+            )
+        if len(self.records) > 1:
+            names = [item.name for item in self.records]
+            if len(set(names)) != len(names):
+                # The parser buckets decoded rows by name and the name becomes
+                # the table heading, so duplicates silently merge two schemas'
+                # rows.
+                raise ValueError("record names must be unique")
+        if self.record_type_field is not None:
+            selectors = [item.selector for item in self.records]
+            if None in selectors:
+                raise ValueError(
+                    "every record needs a selector when record_type_field is set"
+                )
+            if len(set(selectors)) != len(selectors):
+                raise ValueError("record selectors must be unique")
+        return self
+
+
+class EbcdicBackendOptions(BaseBackendOptions):
+    """Options specific to the EBCDIC backend."""
+
+    kind: Annotated[Literal["ebcdic"], Field(exclude=True, repr=False)] = "ebcdic"
+    encoding: Annotated[
+        str,
+        Field(
+            description=(
+                "Python codec used to decode character data, e.g. `cp037` "
+                "(US/Canada), `cp500` (international) or `cp1140` (euro)."
+            )
+        ),
+    ] = "cp037"
+    layout: Annotated[
+        Optional[EbcdicLayout], Field(description="Parsing rules for the file.")
+    ] = None
+    layout_file: Annotated[
+        Optional[Path],
+        Field(description="Path to a JSON file holding the parsing rules."),
+    ] = None
+    max_records: Annotated[
+        Optional[PositiveInt],
+        Field(description="Stop after this many records. Unset reads the whole file."),
+    ] = None
+    strip_control_characters: Annotated[
+        bool,
+        Field(description="Drop control characters from decoded character data."),
+    ] = True
+
+    @model_validator(mode="after")
+    def _validate_layout_source(self) -> "EbcdicBackendOptions":
+        if self.layout is not None and self.layout_file is not None:
+            raise ValueError("set either layout or layout_file, not both")
+        return self
+
+
 BackendOptions = Annotated[
     Union[
         DeclarativeBackendOptions,
+        AsciiDocBackendOptions,
+        CsvBackendOptions,
+        EbcdicBackendOptions,
         EpubBackendOptions,
         HTMLBackendOptions,
+        JatsBackendOptions,
         MarkdownBackendOptions,
         PdfBackendOptions,
         ThreadedDoclingParseBackendOptions,
         MetsGbsBackendOptions,
+        IWorkBackendOptions,
         MsExcelBackendOptions,
         MsPowerpointBackendOptions,
         MsWordBackendOptions,
         OdsBackendOptions,
         LatexBackendOptions,
+        EmailBackendOptions,
         XBRLBackendOptions,
     ],
     Field(discriminator="kind"),

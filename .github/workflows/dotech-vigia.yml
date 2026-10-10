@@ -1,0 +1,586 @@
+# Vigila las versiones del original y las lleva a una solicitud de cambio.
+# Ver docs/superpowers/specs/2026-10-08-sincronizacion-upstream-design.md (en ~/Markitdown).
+#
+# Separación de confianza, job por job:
+# - Los jobs con la llave de la cuenta de servicio (decidir, publicar-rama,
+#   publicar) solo ejecutan los scripts dotech del commit de este workflow
+#   (github.sha), git sin hooks o gh. Nunca código del árbol mezclado.
+# - Los jobs que ejecutan el árbol mezclado o en los que corre Claude (preparar,
+#   tests-*, explicar) no ven esa llave: solo el token de lectura del flujo y,
+#   donde corre Claude, su token OAuth.
+# - preparar no publica: entrega la rama como git bundle y publicar-rama la
+#   empuja desde un runner limpio.
+# - Los tres secretos viven en el entorno `dotech`, que solo admite ejecuciones
+#   desde `main`: un workflow que llegue con la rama sincronizada (o un
+#   dotech-*.yml retocado en ella) no los ve. Solo los jobs que los leen declaran
+#   `environment: dotech`; dotech-pruebas no ve ninguno.
+name: dotech-vigia
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Versión o commit del original (vacío = última versión publicada)"
+        required: false
+        default: ""
+      simular:
+        description: "Simular: rama dotech/sync-prueba y sin solicitud"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dotech-vigia
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: docling-project/docling
+  RAMA: dotech/sync-upstream
+  # En `schedule` el contexto `inputs` está vacío: simular queda en false.
+  SIMULAR: ${{ inputs.simular == true }}
+
+jobs:
+  # Código: scripts dotech de github.sha. Secretos: llave de la cuenta de servicio.
+  decidir:
+    environment: dotech
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      accion: ${{ steps.decision.outputs.accion }}
+      tag: ${{ steps.decision.outputs.tag }}
+      base: ${{ steps.decision.outputs.base }}
+      tag_anterior: ${{ steps.decision.outputs.tag_anterior }}
+      rama_huerfana: ${{ steps.decision.outputs.rama_huerfana }}
+      autor_nombre: ${{ steps.autor.outputs.nombre }}
+      autor_correo: ${{ steps.autor.outputs.correo }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: autor
+        name: Identidad git de la cuenta de servicio
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          id=$(gh api "/users/${SLUG}%5Bbot%5D" --jq .id)
+          echo "nombre=${SLUG}[bot]" >> "$GITHUB_OUTPUT"
+          echo "correo=${id}+${SLUG}[bot]@users.noreply.github.com" >> "$GITHUB_OUTPUT"
+      - name: Apagar automatismos heredados
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: python3 scripts/dotech/workflows_heredados.py --repo "$GITHUB_REPOSITORY"
+      - name: Traer el original
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --quiet --tags upstream
+          git fetch --quiet origin "$RAMA" 2>/dev/null || true
+      - id: decision
+        name: Decidir
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REF_MANUAL: ${{ inputs.ref }}
+        run: python3 scripts/dotech/version.py --repo "$GITHUB_REPOSITORY" --upstream "$UPSTREAM" --rama "$RAMA" --ref "$REF_MANUAL" >> "$GITHUB_OUTPUT"
+
+  # Código: árbol mezclado (setup-ubuntu-ci, tests) y Claude con Edit.
+  # Secretos: CLAUDE_CODE_OAUTH_TOKEN; GITHUB_TOKEN de solo lectura. Sin llave de la App.
+  preparar:
+    needs: decidir
+    if: needs.decidir.outputs.accion == 'sincronizar'
+    environment: dotech
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      sha: ${{ steps.paquete.outputs.sha }}
+      conflicto: ${{ steps.merge.outputs.conflicto }}
+      resumen_conflicto: ${{ steps.cerrar.outputs.resumen }}
+      archivos_de_mas: ${{ steps.cerrar.outputs.de_mas }}
+    env:
+      NOMBRE: ${{ needs.decidir.outputs.autor_nombre }}
+      CORREO: ${{ needs.decidir.outputs.autor_correo }}
+      BASE: ${{ needs.decidir.outputs.base }}
+      # claude-code-action lo lee del entorno del job: limpia de secretos el entorno
+      # de los procesos que lanza Claude (los tests del árbol mezclado).
+      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Identidad y original
+        run: |
+          git config user.name "$NOMBRE"
+          git config user.email "$CORREO"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --quiet --tags upstream
+          git fetch --quiet origin "$RAMA" 2>/dev/null || true
+      - id: merge
+        name: Mezclar la versión
+        env:
+          TAG: ${{ needs.decidir.outputs.tag }}
+        run: |
+          git switch -C trabajo "origin/$BASE"
+          if git merge --no-ff --no-edit -m "chore: merge upstream $TAG" "$TAG"; then
+            echo "conflicto=false" >> "$GITHUB_OUTPUT"
+          elif git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            delim="FIN_$(openssl rand -hex 16)"
+            echo "conflicto=true" >> "$GITHUB_OUTPUT"
+            { echo "archivos<<$delim"; git diff --name-only --diff-filter=U; echo "$delim"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::git merge falló sin dejar un merge en curso: no es un conflicto."
+            exit 1
+          fi
+      # Si el entorno no se puede montar (p. ej. uv.lock en conflicto), Claude sigue:
+      # sin tests no puede dar el conflicto por resuelto y el informe lo marca.
+      - name: Entorno para que Claude corra tests
+        if: steps.merge.outputs.conflicto == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/setup-ubuntu-ci
+        with:
+          python_version: "3.12"
+          uv_sync_args: --frozen --group dev --all-extras --all-packages --no-group docs --no-group examples
+          install_system_deps: "true"
+          cache_models: "true"
+      # Un solo intento. continue-on-error: si Claude falla, agota los 45 minutos o no
+      # devuelve el resumen, el informe sale como «Claude no dio por resuelto el
+      # conflicto» (estado rojo) y la rama se publica igual: no se repite el intento.
+      # --setting-sources user: los ajustes de .claude/ del árbol mezclado no cuentan.
+      - id: claude
+        name: Claude resuelve el conflicto
+        if: steps.merge.outputs.conflicto == 'true'
+        continue-on-error: true
+        timeout-minutes: 45
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Estás en un `git merge` en curso: la versión ${{ needs.decidir.outputs.tag }} del
+            proyecto original de Docling se está mezclando sobre nuestro fork. Hay conflictos en:
+
+            ${{ steps.merge.outputs.archivos }}
+
+            Nuestros arreglos propios están descritos en `scripts/dotech/arreglos.toml`
+            (qué archivos tocan y qué test comprueba cada uno).
+
+            Para cada archivo en conflicto:
+            1. Entiende qué cambió el original (`git log -p ORIG_HEAD..MERGE_HEAD -- <archivo>`)
+               y qué hacía nuestro lado (`git log -p MERGE_HEAD..ORIG_HEAD -- <archivo>`).
+            2. Conserva el comportamiento de nuestro arreglo adaptado a la estructura nueva del
+               original. No reviertas cambios del original. Si nuestro bloque pertenece a código
+               que el original eliminó o movió, lleva nuestro cambio al sitio nuevo.
+            3. Deja el archivo sin marcas de conflicto.
+
+            Después corre los tests de comportamiento de los arreglos afectados con
+            `uv run --no-sync pytest -q -p no:cacheprovider <test>`.
+
+            No hagas commit ni push: el flujo se encarga. Responde con el resumen estructurado:
+            `resuelto` = true solo si no quedan marcas y los tests de los arreglos afectados pasan.
+          claude_args: >-
+            --model claude-sonnet-5-5
+            --max-turns 40
+            --setting-sources user
+            --allowedTools "Read,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(uv run --no-sync pytest:*)"
+            --json-schema '{"type":"object","properties":{"resuelto":{"type":"boolean"},"archivos":{"type":"array","items":{"type":"object","properties":{"archivo":{"type":"string"},"original":{"type":"string"},"decision":{"type":"string"},"tests":{"type":"string"}},"required":["archivo","original","decision","tests"]}}},"required":["resuelto","archivos"]}'
+      # Si quedan marcas se commitea igual y el resumen se vacía (= no resuelto): la
+      # solicitud sale en rojo y para revisar a mano, y la siguiente ejecución ve la
+      # versión ya en la rama y no vuelve a llamar a Claude. Lo que Claude cambió fuera
+      # de los archivos en conflicto no se revierte: se lista en el informe (de_mas),
+      # que lo marca para revisar a mano. La acción de Claude cambia
+      # user.name/user.email a claude[bot]: se restaura la cuenta de servicio.
+      - id: cerrar
+        name: Cerrar el merge
+        if: steps.merge.outputs.conflicto == 'true'
+        env:
+          SALIDA_CLAUDE: ${{ steps.claude.outputs.structured_output }}
+          EN_CONFLICTO: ${{ steps.merge.outputs.archivos }}
+        run: |
+          resumen="$SALIDA_CLAUDE"
+          rc=0
+          git grep -lE '^(<<<<<<<|>>>>>>>)( |$)' -- . || rc=$?
+          case "$rc" in
+            0) echo "::warning::Quedan marcas de conflicto en esos archivos: la solicitud sale para revisar a mano."
+               resumen="" ;;
+            1) ;;
+            *) echo "::error::git grep falló (código $rc) al buscar marcas de conflicto."
+               exit 1 ;;
+          esac
+          tocados=$(git diff --name-only | LC_ALL=C sort -u)
+          en_conflicto=$(printf '%s\n' "$EN_CONFLICTO" | sed '/^$/d' | LC_ALL=C sort -u)
+          de_mas=$(LC_ALL=C comm -23 <(printf '%s\n' "$tocados" | sed '/^$/d') <(printf '%s\n' "$en_conflicto"))
+          if [ -n "$de_mas" ]; then
+            echo "::warning::Claude cambió archivos que no estaban en conflicto: la solicitud sale para revisar a mano."
+            printf '%s\n' "$de_mas"
+          fi
+          git add -u
+          if [ -n "$(git ls-files -u)" ]; then
+            echo "::error::Quedan rutas sin resolver en el índice."
+            exit 1
+          fi
+          git config user.name "$NOMBRE"
+          git config user.email "$CORREO"
+          git -c core.hooksPath=/dev/null commit --no-edit
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "resumen<<$delim"; printf '%s\n' "$resumen"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+          { echo "de_mas<<$delim"; printf '%s\n' "$de_mas"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+      - id: paquete
+        name: Empaquetar la rama
+        run: |
+          mkdir -p "$RUNNER_TEMP/rama"
+          rm -f "$RUNNER_TEMP/rama/rama.bundle"
+          git bundle create "$RUNNER_TEMP/rama/rama.bundle" trabajo "^origin/$BASE"
+          echo "sha=$(git rev-parse trabajo)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rama-mezclada
+          path: ${{ runner.temp }}/rama/rama.bundle
+          if-no-files-found: error
+          overwrite: true
+
+  # Código: solo git (sin hooks) y gh, en un repo vacío; nada del árbol mezclado se
+  # ejecuta. Secretos: llave de la cuenta de servicio.
+  publicar-rama:
+    needs: [decidir, preparar]
+    environment: dotech
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha: ${{ steps.rama.outputs.sha }}
+      destino: ${{ steps.rama.outputs.destino }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rama-mezclada
+          path: ${{ runner.temp }}/rama
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+      - id: rama
+        name: Publicar la rama
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ needs.decidir.outputs.base }}
+          HUERFANA: ${{ needs.decidir.outputs.rama_huerfana }}
+          SHA_ESPERADO: ${{ needs.preparar.outputs.sha }}
+        run: |
+          if [ "$SIMULAR" = "true" ]; then destino=dotech/sync-prueba; else destino="$RAMA"; fi
+          remoto="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git init -q "$RUNNER_TEMP/repo"
+          cd "$RUNNER_TEMP/repo"
+          git config core.hooksPath /dev/null
+          git fetch --quiet --no-tags "$remoto" "refs/heads/$BASE:refs/remotes/origin/$BASE"
+          git bundle verify -q "$RUNNER_TEMP/rama/rama.bundle"
+          git fetch --quiet --no-tags "$RUNNER_TEMP/rama/rama.bundle" "refs/heads/trabajo:refs/heads/trabajo"
+          sha=$(git rev-parse refs/heads/trabajo)
+          if [ "$sha" != "$SHA_ESPERADO" ]; then
+            echo "::error::El bundle trae $sha y preparar anunció $SHA_ESPERADO."
+            exit 1
+          fi
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          empujar() {
+            git -c core.hooksPath=/dev/null \
+              -c "http.$GITHUB_SERVER_URL/.extraheader=AUTHORIZATION: basic $auth" \
+              push --quiet "$remoto" "$@"
+          }
+          if [ "$SIMULAR" = "true" ] || [ "$HUERFANA" = "true" ]; then
+            empujar --delete "refs/heads/$destino" 2>/dev/null || true
+          fi
+          empujar "$sha:refs/heads/$destino"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "destino=$destino" >> "$GITHUB_OUTPUT"
+
+  # Código: árbol del original y árbol mezclado. Secretos: ninguno (GITHUB_TOKEN de lectura).
+  tests-original:
+    needs: [decidir, publicar-rama]
+    uses: ./.github/workflows/dotech-pruebas.yml
+    with:
+      lado: original
+      repositorio: docling-project/docling
+      ref: ${{ needs.decidir.outputs.tag }}
+      sha_nuestra: ${{ needs.publicar-rama.outputs.sha }}
+      evaluar_sobra: true
+
+  tests-nuestra:
+    needs: [decidir, publicar-rama]
+    uses: ./.github/workflows/dotech-pruebas.yml
+    with:
+      lado: nuestra
+      repositorio: ${{ github.repository }}
+      ref: ${{ needs.publicar-rama.outputs.sha }}
+      sha_nuestra: ${{ needs.publicar-rama.outputs.sha }}
+
+  # Código: scripts dotech de github.sha sobre los resultados (datos). Secretos: ninguno.
+  comparar:
+    needs: [decidir, publicar-rama, tests-original, tests-nuestra]
+    if: always() && needs.publicar-rama.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      hay_nuestras: ${{ steps.c.outputs.hay_nuestras }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tests-*
+          path: artefactos
+      - id: c
+        name: Atribuir fallos y listar el lote
+        env:
+          TAG: ${{ needs.decidir.outputs.tag }}
+          TAG_ANTERIOR: ${{ needs.decidir.outputs.tag_anterior }}
+          SHA: ${{ needs.publicar-rama.outputs.sha }}
+        run: |
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --quiet --tags upstream
+          # Un artefacto de otro commit (p. ej. de un intento anterior) no cuenta:
+          # se descarta y la comparación lo trata como corrida sin resultado.
+          descartar_si_ajeno() {
+            if [ "$(cat "$1/ref.txt" 2>/dev/null)" != "$2" ]; then
+              echo "::warning::$1 no corresponde a $2; se descarta."
+              rm -rf "$1"
+            fi
+          }
+          descartar_si_ajeno artefactos/tests-original "$(git rev-parse "$TAG^{commit}")"
+          descartar_si_ajeno artefactos/tests-nuestra "$SHA"
+          mkdir -p artefactos/tests-original artefactos/tests-nuestra
+          python3 scripts/dotech/comparar_junit.py --original artefactos/tests-original \
+            --nuestra artefactos/tests-nuestra --salida comparacion.json >> "$GITHUB_OUTPUT"
+          python3 scripts/dotech/lote.py --registro scripts/dotech/arreglos.toml \
+            --desde "$TAG_ANTERIOR" --hasta "$TAG" --salida lote.json
+          cp artefactos/tests-original/sobra.json sobra.json 2>/dev/null || echo '{}' > sobra.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: informe-datos
+          path: |
+            comparacion.json
+            lote.json
+            sobra.json
+          if-no-files-found: error
+          overwrite: true
+
+  # Código: Claude en solo lectura sobre el árbol mezclado.
+  # Secretos: CLAUDE_CODE_OAUTH_TOKEN; GITHUB_TOKEN de lectura. Sin llave de la App.
+  explicar:
+    needs: [decidir, publicar-rama, comparar]
+    if: always() && needs.comparar.outputs.hay_nuestras == 'true'
+    environment: dotech
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      explicacion: ${{ steps.texto.outputs.explicacion }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.publicar-rama.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: informe-datos
+      # Si Claude falla, la solicitud sale sin explicación, no sin informe.
+      - id: claude
+        name: Claude explica los fallos nuestros
+        continue-on-error: true
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          prompt: |
+            Tras mezclar la versión ${{ needs.decidir.outputs.tag }} del original en nuestro fork,
+            fallan tests que en el original pasan. Están en `comparacion.json` (clave `nuestras`,
+            con su mensaje en `mensajes`). Los cambios del lote que tocan nuestros arreglos están
+            en `lote.json`, y nuestros arreglos en `scripts/dotech/arreglos.toml`.
+
+            Lee el test que falla y los cambios relacionados, y explica en un párrafo corto, en
+            español y sin jerga, la causa probable: qué cambió el original y por qué choca con
+            nuestro arreglo. No propongas código ni toques archivos.
+          claude_args: >-
+            --model claude-haiku-5-5
+            --max-turns 5
+            --setting-sources user
+            --allowedTools "Read,Glob,Grep,Bash(git log:*),Bash(git show:*)"
+            --json-schema '{"type":"object","properties":{"explicacion":{"type":"string"}},"required":["explicacion"]}'
+      - id: texto
+        name: Extraer la explicación
+        env:
+          SALIDA: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          explicacion=""
+          if [ -n "$SALIDA" ]; then
+            explicacion=$(printf '%s' "$SALIDA" | jq -r '.explicacion // empty' 2>/dev/null) || explicacion=""
+          fi
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "explicacion<<$delim"; printf '%s\n' "$explicacion"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+
+  # Código: scripts dotech y registro de github.sha sobre los datos del informe.
+  # Secretos: llave de la cuenta de servicio.
+  publicar:
+    needs: [decidir, preparar, publicar-rama, comparar, explicar]
+    if: always() && needs.publicar-rama.result == 'success'
+    environment: dotech
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SHA: ${{ needs.publicar-rama.outputs.sha }}
+      TAG: ${{ needs.decidir.outputs.tag }}
+      ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+      # La rama ya está publicada: si la comparación no terminó, el commit recibe un
+      # estado rojo en vez de quedarse sin estado.
+      - name: ¿Terminó la comparación?
+        env:
+          COMPARAR: ${{ needs.comparar.result }}
+        run: |
+          if [ "$COMPARAR" != "success" ]; then
+            echo "::error::La comparación terminó en «$COMPARAR»: no hay informe."
+            exit 1
+          fi
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: informe-datos
+          path: ${{ runner.temp }}/datos
+      # Se leen los objetos del commit con git; no se ejecuta nada de ese árbol.
+      # propios: lo que la rama cambia desde que se separó de main en los workflows
+      # dotech-* o en scripts/dotech/. Una versión del original nunca los toca.
+      - id: revision
+        name: Revisar la rama (marcas y archivos propios)
+        run: |
+          git fetch --quiet --no-tags origin "+refs/heads/main:refs/remotes/origin/main" "$SHA"
+          rc=0
+          git grep -lE '^(<<<<<<<|>>>>>>>)( |$)' "$SHA" -- || rc=$?
+          case "$rc" in
+            0) echo "::error::La rama tiene marcas de conflicto."
+               echo "marcas=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "marcas=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::git grep falló (código $rc) al buscar marcas de conflicto."
+               exit 1 ;;
+          esac
+          propios=$(git diff --name-only --no-renames "origin/main...$SHA" -- '.github/workflows/dotech-*' scripts/dotech/)
+          if [ -n "$propios" ]; then
+            echo "::warning::La rama cambia archivos de la automatización dotech: la solicitud sale para revisar a mano."
+            printf '%s\n' "$propios"
+          fi
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "propios<<$delim"; printf '%s\n' "$propios"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+      # El título actual decide si la marca de revisión a mano se conserva.
+      - id: solicitud
+        name: Buscar la solicitud abierta
+        if: env.SIMULAR != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          pr=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$RAMA" --base main --state open \
+            --json number,title,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0] // {}')
+          echo "numero=$(jq -r '.number // empty' <<<"$pr")" >> "$GITHUB_OUTPUT"
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "titulo<<$delim"; jq -r '.title // empty' <<<"$pr"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+      - id: informe
+        name: Escribir el informe
+        env:
+          CONFLICTO: ${{ needs.preparar.outputs.conflicto }}
+          RESUMEN_CONFLICTO: ${{ needs.preparar.outputs.resumen_conflicto }}
+          EXPLICACION: ${{ needs.explicar.outputs.explicacion }}
+          TAG_ANTERIOR: ${{ needs.decidir.outputs.tag_anterior }}
+          TITULO_ACTUAL: ${{ steps.solicitud.outputs.titulo }}
+          MARCAS: ${{ steps.revision.outputs.marcas }}
+          ARCHIVOS_DE_MAS: ${{ needs.preparar.outputs.archivos_de_mas }}
+          ARCHIVOS_PROPIOS: ${{ steps.revision.outputs.propios }}
+        run: |
+          d="$RUNNER_TEMP/datos"
+          python3 scripts/dotech/informe.py --registro scripts/dotech/arreglos.toml \
+            --tag "$TAG" --tag-anterior "$TAG_ANTERIOR" --comparacion "$d/comparacion.json" \
+            --sobra "$d/sobra.json" --lote "$d/lote.json" --enlace "$ENLACE" \
+            --salida-cuerpo "$d/cuerpo.md" --salida-comentario "$d/comentario.md" >> "$GITHUB_OUTPUT"
+          cat "$d/cuerpo.md" >> "$GITHUB_STEP_SUMMARY"
+      # El resumen del conflicto va también como comentario: el cuerpo lo reescribe
+      # la siguiente versión. La primera línea del comentario evita repetirlo.
+      - name: Abrir o actualizar la solicitud
+        if: env.SIMULAR != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TITULO: ${{ steps.informe.outputs.titulo }}
+          NUMERO: ${{ steps.solicitud.outputs.numero }}
+        run: |
+          cuerpo="$RUNNER_TEMP/datos/cuerpo.md"
+          comentario="$RUNNER_TEMP/datos/comentario.md"
+          numero="$NUMERO"
+          if [ -z "$numero" ]; then
+            url=$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$RAMA" \
+              --title "$TITULO" --body-file "$cuerpo" --reviewer mrshelll,alejojau)
+            numero="${url##*/}"
+          else
+            gh pr edit "$numero" -R "$GITHUB_REPOSITORY" --title "$TITULO" --body-file "$cuerpo"
+          fi
+          if [ -s "$comentario" ]; then
+            marca=$(head -n 1 "$comentario")
+            existentes=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$numero/comments" --jq '.[].body' | tr -d '\r')
+            if ! grep -qxF -- "$marca" <<<"$existentes"; then
+              gh pr comment "$numero" -R "$GITHUB_REPOSITORY" --body-file "$comentario"
+            fi
+          fi
+      - name: Estados del commit
+        if: env.SIMULAR != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ESTADO: ${{ steps.informe.outputs.estado }}
+          DESCRIPCION: ${{ steps.informe.outputs.descripcion }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
+            -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
+            -f context=dotech/validacion-local -f description="Falta docling-validar en el Mac de Miguel"
+      # La solicitud lleva la marca de revisión a mano (el mismo formato que
+      # informe.titulo): si ya existía, su título pasa a la versión nueva; si la rama
+      # se publicó sin solicitud, se abre ya marcada. Así la siguiente ejecución ve
+      # la versión dentro de una solicitud abierta y no rehace la mezcla.
+      - name: Marcar el fallo en el commit
+        if: failure() && env.SIMULAR != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=failure \
+            -f context=dotech/tests -f description="La sincronización falló antes de publicar el informe" \
+            -f target_url="$ENLACE"
+          titulo="[conflicto para revisar a mano] Pasar a $TAG"
+          numero=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$RAMA" --base main --state open \
+            --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')
+          if [ -n "$numero" ]; then
+            gh pr edit "$numero" -R "$GITHUB_REPOSITORY" --title "$titulo"
+          else
+            gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$RAMA" --title "$titulo" \
+              --body "La sincronización con $TAG falló antes de escribir el informe ($ENLACE). Revisar a mano: mientras esta solicitud siga abierta, la siguiente ejecución no rehace la mezcla." \
+              --reviewer mrshelll,alejojau
+          fi
+      - name: Limpiar la simulación
+        if: always() && env.SIMULAR == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/dotech/sync-prueba"

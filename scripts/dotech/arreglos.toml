@@ -1,0 +1,30 @@
+# Arreglos propios del fork. Lo lee la sincronización automática para saber qué
+# probar sobre cada versión del original. `test_comportamiento` solo puede usar la
+# API del original: si importara un módulo nuestro, fallaría sobre el original por
+# importación y no por comportamiento.
+
+[[arreglo]]
+clave = "bug2"
+nombre = "Bug 2 — etiqueta y valor separados en formularios"
+en_main = true
+archivos = [
+  "docling/utils/layout_postprocessor.py",
+  "docling/models/stages/reading_order/readingorder_model.py",
+]
+test_comportamiento = "tests/test_layout_key_value_reading_order.py"
+
+[[arreglo]]
+clave = "bug45"
+nombre = "Bugs 4 y 5 — el VLM da éxito con salida vacía o en bucle"
+en_main = true
+archivos = ["docling/pipeline/vlm_pipeline.py", "docling/utils/vlm_response_quality.py"]
+test_comportamiento = "tests/test_vlm_degenerate_status.py"
+
+[[arreglo]]
+clave = "bug1"
+nombre = "Bug 1 — palabras pegadas en celdas de tabla (protección propia)"
+en_main = false
+rama = "fix/table-cell-spacing"
+archivos = ["docling/models/stages/table_structure/table_structure_model.py"]
+test_comportamiento = "tests/test_table_cell_spacing.py"
+fixtures = ["tests/data/pdf/table_cell_spacing.pdf"]

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Section-header level inference for the PDF/image pipeline.
 
 The layout model classifies regions as ``SECTION_HEADER`` without a level, so every heading
@@ -15,8 +18,12 @@ produced by the PDF path defaults to ``level=1`` and the document hierarchy is f
 2. **numbering** -- legal/outline numbering such as ``PART I -> 1. -> 1.1 -> (a) -> (i)``.
    The primary signal for headings without a bookmark match: on legal/regulatory documents
    numbering is far more reliable than styling, which is often uniform.
-3. **style** -- font size approximated from the parsed PDF cells, used only for headings
-   that have neither a bookmark match nor recognizable numbering.
+3. **style** -- the heading's visual style, read from the parsed PDF cells, used only for
+   headings that have neither a bookmark match nor recognizable numbering. Headings are ranked
+   by font size first -- with near-equal sizes merged, since the size is measured from the cells
+   and the same font measures taller on a heading that has descenders -- and then by font weight,
+   slant and letter case, so that headings sharing a size are still separated (bold above
+   regular, upright above italic, all-caps above mixed).
 
 Apart from promoting a confidently bookmark-matched list-item, the model only rewrites heading
 levels -- it never adds, removes or reorders items. The core
@@ -26,16 +33,18 @@ drive the style fallback.
 """
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from statistics import median
 
 from docling_core.types.doc import DoclingDocument
 from docling_core.types.doc.document import ListItem, SectionHeaderItem
-from docling_core.types.doc.page import SegmentedPdfPage
+from docling_core.types.doc.page import PdfTextCell, SegmentedPdfPage
 
 from docling.datamodel.document import ConversionResult
 from docling.datamodel.pipeline_options import HeadingHierarchyOptions
+from docling.utils.font_style import parse_font_style, weight_class
 from docling.utils.pdf_outline import _PdfOutlineItem
 
 # Default precedence of numbering schemes, highest hierarchy level first. ``dotted`` shares
@@ -43,6 +52,8 @@ from docling.utils.pdf_outline import _PdfOutlineItem
 _DEFAULT_FAMILY_ORDER = [
     "part",  # PART I / TITLE I / BOOK I
     "chapter",  # CHAPTER 1
+    "division",  # DIVISION I / Division 1 / Division A
+    "subdivision",  # SUBDIVISION A / Subdivision a
     "article",  # ARTICLE 1 / SECTION 1 / Clause / § 1
     "roman_u",  # I. II. III.
     "arabic",  # 1. 2. 3.  (and dotted 1.1, 1.1.1 by depth)
@@ -61,17 +72,29 @@ _ROMAN_RE = re.compile(
 )
 
 _KW_PART = re.compile(r"^(part|title|book)\b", re.IGNORECASE)
-_KW_CHAPTER = re.compile(r"^(chapter)\b", re.IGNORECASE)
+# Skip statute citations like "Chapter A-15" (letter-dash-digit); real chapters still match.
+_KW_CHAPTER = re.compile(r"^(chapter)\b(?!\s+[a-z]-\d)", re.IGNORECASE)
 _KW_ARTICLE = re.compile(
     r"^(article|section|clause|schedule|annex|appendix|rule)\b", re.IGNORECASE
 )
+# "Division"/"Subdivision" are ordinary words too ("Division of Powers"), so -- unlike
+# part/chapter/article -- they only count as numbering when an explicit enumerator (an
+# Arabic index, a Roman numeral, or a single letter) follows. The enumerator must be
+# terminated by whitespace, end-of-string, or separator punctuation, so a French elision
+# such as "Division d'appel" (a letter followed by an apostrophe) is not read as a marker.
+_KW_ENUM = r"\s+(\d+|[a-z]|[ivxlcdm]+)(?=\s|$|[.,:;)\]\u2013\u2014-])"
+_KW_DIVISION = re.compile(r"^division" + _KW_ENUM, re.IGNORECASE)
+_KW_SUBDIVISION = re.compile(r"^subdivision" + _KW_ENUM, re.IGNORECASE)
 _SECTION_SYMBOL = re.compile(r"^§+\s*\d")  # § 1 / §§ 1.2
-# Dotted decimal outline (1.1, 1.1.1, ...), terminated by space/end/punctuation.
-_DOTTED = re.compile(r"^(\d+(?:\.\d+)+)(?:[.)\]\s]|$)")
-# Single Arabic index (1. / 2)).
-_ARABIC = re.compile(r"^(\d+)[.)]")
-# Single/multi letter marker, optionally parenthesized: (a) / A. / (iv) / IV.
-_LETTER = re.compile(r"^\(?\s*([A-Za-z]+)\s*[).]")
+_SEP = r"(?:[)\]]|[:\-\u2013\u2014](?=\s|$))"
+# Dotted decimal outline (1.1, 1.1.1, ...), terminated by punctuation/space/end.
+_DOTTED = re.compile(r"^\(?\s*(\d+(?:\.\d+)+)(?:[.)\]\s]|[:\-\u2013\u2014](?=\s|$)|$)")
+# Single Arabic index (1. / 1) / (1) / 1: / 1 -).
+_ARABIC = re.compile(r"^\(?\s*(\d+)\s*(?:\.(?!\d)|" + _SEP + r")")
+# A bare index is only accepted with document-wide sequence evidence.
+_BARE_ARABIC = re.compile(r"^(\d+)\s+\S")
+# Single/multi letter marker, optionally parenthesized: (a) / A. / (iv) / IV. / A: / A -
+_LETTER = re.compile(r"^\(?\s*([A-Za-z]+)\s*(?:\.|" + _SEP + r")")
 
 
 @dataclass
@@ -105,6 +128,18 @@ def _classify_letter(token: str) -> _Marker | None:
     return None
 
 
+def _keyword_enumerator(m: re.Match[str] | None) -> bool:
+    """True when a keyword match carries a real enumerator (digit, letter, or Roman).
+
+    Multi-letter tokens are only accepted when they are valid Roman numerals, so
+    "Division Civil Remedies" (all Roman-numeral letters) is not mistaken for a marker.
+    """
+    if m is None:
+        return False
+    tok = m.group(1)
+    return tok.isdigit() or len(tok) == 1 or _is_roman(tok)
+
+
 def _parse_marker(text: str) -> _Marker | None:
     """Extract the leading numbering marker from a heading, or None if unnumbered."""
     s = (text or "").strip()
@@ -113,6 +148,10 @@ def _parse_marker(text: str) -> _Marker | None:
 
     if _KW_PART.match(s):
         return _Marker(family="part")
+    if _keyword_enumerator(_KW_DIVISION.match(s)):
+        return _Marker(family="division")
+    if _keyword_enumerator(_KW_SUBDIVISION.match(s)):
+        return _Marker(family="subdivision")
     if _KW_CHAPTER.match(s):
         return _Marker(family="chapter")
     if _KW_ARTICLE.match(s) or _SECTION_SYMBOL.match(s):
@@ -174,6 +213,39 @@ def _family_rank(family: str, order: list[str]) -> int:
         return len(order)  # unknown scheme -> lowest priority
 
 
+def _resolve_bare_arabic(
+    headings: list[SectionHeaderItem], markers: list[_Marker | None]
+) -> None:
+    """Accept bare Arabic indices in consecutive runs starting at 1, with at least two entries.
+
+    A leading number alone may be a year or quantity. Require a chapter sequence before treating
+    it as numbering, allowing explicit Arabic markers to provide evidence too. Dotted sections
+    and unnumbered headings may intervene. A gap such as ``1 Intro``, ``2 Methods``, ``4 Results``
+    ends the run, leaving the bare ``4`` unrecognized. A 1-based run of incidental headings, such
+    as ``1 January``, ``2 February`` or ``1 kg``, ``2 kg``, can still be misclassified.
+    """
+    sequence: list[int] = []
+    for i, heading in enumerate(headings):
+        marker = markers[i]
+        if marker is not None and marker.family != "arabic":
+            continue
+        text = heading.text.strip()
+        match = _ARABIC.match(text) if marker is not None else _BARE_ARABIC.match(text)
+        if match is None:
+            continue
+        number = int(match.group(1))
+        if number == 1:
+            sequence = [i]
+        elif sequence and number == len(sequence) + 1:
+            sequence.append(i)
+            # Confirm the first entry when 2 arrives, then only the newly extended pair.
+            for index in sequence[-2:]:
+                if markers[index] is None:
+                    markers[index] = _Marker(family="arabic")
+        else:
+            sequence = []
+
+
 def _infer_from_numbering(
     headings: list[SectionHeaderItem], options: HeadingHierarchyOptions
 ) -> dict[int, int]:
@@ -181,6 +253,7 @@ def _infer_from_numbering(
     order = options.numbering_schemes or _DEFAULT_FAMILY_ORDER
     markers = [_parse_marker(h.text) for h in headings]
     _resolve_ambiguous(markers)
+    _resolve_bare_arabic(headings, markers)
 
     keys: dict[int, tuple[int, int]] = {}
     for i, m in enumerate(markers):
@@ -198,10 +271,38 @@ def _infer_from_numbering(
     return {i: key_to_level[key] for i, key in keys.items()}
 
 
-def _heading_font_size(
-    item: SectionHeaderItem, parsed_pages: dict[int, SegmentedPdfPage]
-) -> float | None:
-    """Median height of parsed PDF cells overlapping the heading, as a font-size proxy."""
+@dataclass(frozen=True)
+class _HeadingStyle:
+    """The visual style of a heading, used as the ranking key of the style fallback."""
+
+    size: float  # median height of the underlying cells, as a font-size proxy
+    weight_cls: int = 0  # 0 light/regular, 1 medium/semibold, 2 bold and above
+    italic: bool = False
+    caps: bool = False
+
+
+# Share of the heading's characters that must be italic for the heading to count as italic.
+_ITALIC_RATIO = 0.6
+
+
+def _is_all_caps(text: str) -> bool:
+    """Whether the text is written in capitals (ignoring digits and punctuation)."""
+    letters = [char for char in text if char.isalpha()]
+    return len(letters) >= 4 and all(char.isupper() for char in letters)
+
+
+def _heading_style(
+    item: SectionHeaderItem,
+    parsed_pages: dict[int, SegmentedPdfPage],
+    options: HeadingHierarchyOptions,
+) -> _HeadingStyle | None:
+    """Style of a heading, derived from the parsed PDF cells overlapping it.
+
+    Weight and slant are a character-weighted vote across those cells, since a heading can mix
+    fonts (a regular "1.1 " in front of a bold title). Cells without font information -- OCR
+    output, the pypdfium2 backend, or names that carry no recognizable styling -- contribute
+    their size but leave the heading at the regular weight, so the ranking degrades to font size.
+    """
     if not item.prov:
         return None
     prov = item.prov[0]
@@ -212,15 +313,61 @@ def _heading_font_size(
     page_height = parsed.dimension.height
     hbox = prov.bbox.to_top_left_origin(page_height)
     heights: list[float] = []
+    weights: Counter[int] = Counter()
+    styled_chars = 0
+    italic_chars = 0
     for cell in parsed.textline_cells:
         if not cell.text or not cell.text.strip():
             continue
         cbox = cell.rect.to_bounding_box().to_top_left_origin(page_height)
-        if hbox.overlaps(cbox):
-            heights.append(cell.rect.height)
+        if not hbox.overlaps(cbox):
+            continue
+        heights.append(cell.rect.height)
+
+        if not options.use_font_style or not isinstance(cell, PdfTextCell):
+            continue
+        style = parse_font_style(cell.font_name)
+        if not style.known:
+            continue
+        chars = len(cell.text.strip())
+        weights[weight_class(style.weight)] += chars
+        styled_chars += chars
+        if style.italic:
+            italic_chars += chars
+
     if not heights:
         return None
-    return median(heights)
+    size = median(heights)
+    if not options.use_font_style:
+        return _HeadingStyle(size=size)
+    return _HeadingStyle(
+        size=size,
+        # On a tie, the heavier class wins: emphasis is what makes a heading stand out.
+        weight_cls=max(weights, key=lambda cls: (weights[cls], cls), default=0),
+        italic=bool(styled_chars) and italic_chars / styled_chars >= _ITALIC_RATIO,
+        caps=_is_all_caps(item.text),
+    )
+
+
+def _cluster_sizes(sizes: set[float], tolerance: float) -> dict[float, int]:
+    """Group font sizes into clusters, largest first, and map each size to its cluster index.
+
+    The size of a heading is the median height of its cells, which measures the glyphs that are
+    actually on the line rather than the font size: a heading with descenders ("Securing and
+    protecting") measures a couple of points taller than one without ("Contents") in the very same
+    font. Treating every distinct height as its own level therefore invents levels and, because
+    each level then holds a single heading, leaves no headings for weight or slant to separate.
+    Consecutive sizes within ``tolerance`` (relative) are merged to absorb that measurement noise.
+    """
+    clusters: dict[float, int] = {}
+    index = 0
+    previous: float | None = None
+    for size in sorted(sizes, reverse=True):
+        if previous is not None and (previous - size) > tolerance * previous:
+            index += 1
+        clusters[size] = index
+        previous = size
+    return clusters
 
 
 def _infer_from_style(
@@ -228,24 +375,30 @@ def _infer_from_style(
     parsed_pages: dict[int, SegmentedPdfPage],
     options: HeadingHierarchyOptions,
 ) -> dict[int, int]:
-    """Map heading index -> level from font size buckets (larger size = higher level)."""
+    """Map heading index -> level from the heading styles (most prominent style = level 1)."""
     if not parsed_pages:
         return {}
-    sizes: dict[int, float] = {}
+    styles: dict[int, _HeadingStyle] = {}
     for i, heading in enumerate(headings):
-        size = _heading_font_size(heading, parsed_pages)
-        if size is not None:
-            sizes[i] = size
-    if not sizes:
+        style = _heading_style(heading, parsed_pages, options)
+        if style is not None:
+            styles[i] = style
+    if not styles:
         return {}
 
-    # Bucket by rounded point size; the largest size becomes level 1.
-    rounded = {i: round(size) for i, size in sizes.items()}
-    ranked = {
-        size: lvl
-        for lvl, size in enumerate(sorted(set(rounded.values()), reverse=True), start=1)
+    clusters = _cluster_sizes(
+        {style.size for style in styles.values()}, options.style_size_tolerance
+    )
+    # Order by size first, then by how much the heading stands out within its size: heavier before
+    # lighter, upright before italic (italic sits lighter on the page), capitals before mixed case.
+    keys = {
+        i: (clusters[style.size], -style.weight_cls, style.italic, not style.caps)
+        for i, style in styles.items()
     }
-    return {i: ranked[size] for i, size in rounded.items()}
+    # Compress the distinct keys actually present into contiguous levels, so a signal that does
+    # not vary across the document's headings (e.g. all of them bold) adds no levels.
+    ranked = {key: lvl for lvl, key in enumerate(sorted(set(keys.values())), start=1)}
+    return {i: ranked[key] for i, key in keys.items()}
 
 
 # --------------------------------------------------------------------------------- bookmarks
@@ -254,12 +407,12 @@ def _infer_from_style(
 # matches an on-page heading "1.1 Definitions" (and vice-versa).
 _LEADING_MARKER = re.compile(
     r"^\s*(?:"
-    r"(?:part|title|book|chapter|article|section|clause|schedule|annex|appendix|rule)"
+    r"(?:part|title|book|division|subdivision|chapter|article|section|clause|schedule|annex|appendix|rule)"
     r"\b[\s.:]*[0-9ivxlcdm]*"
     r"|§+\s*[0-9.]+"
-    r"|\(?[0-9]+(?:\.[0-9]+)*[).]?"
-    r"|\(?[A-Za-z]{1,2}[).]"
-    r")[\s.:)\-]*",
+    r"|\(?[0-9]+(?:\.[0-9]+)*[.)\]]?"
+    r"|\(?[A-Za-z]{1,2}(?:[.)\]]|(?=\s*[:\-\u2013\u2014]))"
+    r")[\s.:)\-\u2013\u2014]*",
     re.IGNORECASE,
 )
 

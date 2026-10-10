@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 """Configuration models for docling's automatic speech recognition (ASR) backends.
 
 This module defines the option classes that configure how audio is transcribed.
@@ -159,16 +162,18 @@ class InlineAsrNativeWhisperOptions(InlineAsrOptions):
         ),
     ] = InferenceAsrFramework.WHISPER
     language: Annotated[
-        str,
+        Optional[str],
         Field(
             description=(
-                "Language code for transcription. Specifying the correct "
-                "language improves accuracy. Use ISO 639-1 codes (e.g., `en`, "
-                "`es`, `fr`)."
+                "Language code for transcription. When `None` (the default), "
+                "Whisper auto-detects the language from the first 30 seconds "
+                "of audio. Specifying the correct language skips detection and "
+                "improves accuracy. Use ISO 639-1 codes (e.g., `en`, `es`, "
+                "`fr`)."
             ),
             examples=["en", "es", "fr", "de"],
         ),
-    ] = "en"
+    ] = None
     supported_devices: Annotated[
         list[AcceleratorDevice],
         Field(
@@ -230,16 +235,18 @@ class InlineAsrMlxWhisperOptions(InlineAsrOptions):
         ),
     ] = InferenceAsrFramework.MLX
     language: Annotated[
-        str,
+        Optional[str],
         Field(
             description=(
-                "Language code for transcription. Specifying the correct "
-                "language improves accuracy. Use ISO 639-1 codes (e.g., `en`, "
-                "`es`, `fr`)."
+                "Language code for transcription. When `None` (the default), "
+                "Whisper auto-detects the language from the first 30 seconds "
+                "of audio. Specifying the correct language skips detection and "
+                "improves accuracy. Use ISO 639-1 codes (e.g., `en`, `es`, "
+                "`fr`)."
             ),
             examples=["en", "es", "fr", "de"],
         ),
-    ] = "en"
+    ] = None
     task: Annotated[
         str,
         Field(

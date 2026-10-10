@@ -1,0 +1,178 @@
+# Abre una solicitud a main con la cuenta de servicio y le pasa los tests.
+# Con la regla de dos aprobaciones, una solicitud abierta por Miguel solo podría
+# aprobarla Fabio; abierta por la cuenta de servicio, la aprueban los dos.
+#
+# Separación de confianza: abrir y estado tienen la llave de la cuenta de
+# servicio y solo ejecutan gh y los scripts dotech del commit de este workflow
+# (github.sha); nunca código de la rama de la solicitud. Los tests, que sí
+# ejecutan esa rama, no ven la llave. Los secretos viven en el entorno `dotech`,
+# que solo admite ejecuciones desde `main`; solo abrir y estado lo declaran.
+name: dotech-abrir-solicitud
+
+on:
+  workflow_dispatch:
+    inputs:
+      rama:
+        description: "Rama a integrar en main"
+        required: true
+      titulo:
+        description: "Título de la solicitud"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Código: solo gh, sin checkout. Secretos: llave de la cuenta de servicio.
+  abrir:
+    environment: dotech
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.datos.outputs.sha }}
+      main: ${{ steps.datos.outputs.main }}
+      numero: ${{ steps.datos.outputs.numero }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+      # Si la solicitud ya existe (otra ejecución sobre la misma rama), se reutiliza
+      # y solo se vuelven a pasar los tests.
+      - id: datos
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          RAMA: ${{ inputs.rama }}
+          TITULO: ${{ inputs.titulo }}
+        run: |
+          numero=$(gh pr list -R "$GITHUB_REPOSITORY" --head "$RAMA" --base main --state open \
+            --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')
+          if [ -z "$numero" ]; then
+            url=$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$RAMA" --title "$TITULO" \
+              --body "Abierta por la cuenta de servicio para que la aprueben Miguel y Fabio. Antes de aprobar: \`docling-validar <número>\` en el Mac de Miguel." \
+              --reviewer mrshelll,alejojau)
+            numero="${url##*/}"
+          else
+            echo "::notice::La solicitud #$numero ya estaba abierta: se vuelven a pasar los tests."
+          fi
+          sha=$(gh pr view "$numero" -R "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+          main=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          { echo "sha=$sha"; echo "main=$main"; echo "numero=$numero"; } >> "$GITHUB_OUTPUT"
+
+  # Código: main y la rama de la solicitud. Secretos: ninguno (GITHUB_TOKEN de lectura).
+  tests-original:
+    needs: abrir
+    uses: ./.github/workflows/dotech-pruebas.yml
+    with:
+      lado: original
+      repositorio: ${{ github.repository }}
+      ref: ${{ needs.abrir.outputs.main }}
+      sha_nuestra: ${{ needs.abrir.outputs.sha }}
+
+  tests-nuestra:
+    needs: abrir
+    uses: ./.github/workflows/dotech-pruebas.yml
+    with:
+      lado: nuestra
+      repositorio: ${{ github.repository }}
+      ref: ${{ needs.abrir.outputs.sha }}
+      sha_nuestra: ${{ needs.abrir.outputs.sha }}
+
+  # Código: scripts dotech de github.sha sobre los resultados (datos).
+  # Secretos: llave de la cuenta de servicio.
+  estado:
+    needs: [abrir, tests-original, tests-nuestra]
+    if: always() && needs.abrir.result == 'success'
+    environment: dotech
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SHA: ${{ needs.abrir.outputs.sha }}
+      MAIN: ${{ needs.abrir.outputs.main }}
+      NUMERO: ${{ needs.abrir.outputs.numero }}
+      ENLACE: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tests-*
+          path: artefactos
+      # Marcas de conflicto en archivos que ningún test toca no deben salir en verde.
+      # Se leen los objetos del commit con git grep; no se ejecuta nada de ese árbol.
+      - id: marcas
+        name: Buscar marcas de conflicto
+        run: |
+          git fetch --quiet --no-tags --depth=1 origin "$SHA"
+          rc=0
+          git grep -lE '^(<<<<<<<|>>>>>>>)( |$)' "$SHA" -- || rc=$?
+          case "$rc" in
+            0) echo "::error::La rama de la solicitud tiene marcas de conflicto."
+               echo "hay=true" >> "$GITHUB_OUTPUT" ;;
+            1) echo "hay=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::git grep falló (código $rc) al buscar marcas de conflicto."
+               exit 1 ;;
+          esac
+      # Mientras el título lleve la marca de revisión a mano, dotech/tests sale en rojo:
+      # la quita una persona después de revisar. Se lee justo antes de publicar.
+      - id: solicitud
+        name: Leer el título de la solicitud
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "titulo<<$delim"; gh pr view "$NUMERO" -R "$GITHUB_REPOSITORY" --json title --jq .title; echo "$delim"; } >> "$GITHUB_OUTPUT"
+      - id: atribuir
+        name: Atribuir fallos
+        env:
+          MARCAS: ${{ steps.marcas.outputs.hay }}
+          TITULO_ACTUAL: ${{ steps.solicitud.outputs.titulo }}
+        run: |
+          # Un artefacto de otro commit (p. ej. de un intento anterior) no cuenta:
+          # se descarta y la comparación lo trata como corrida sin resultado.
+          descartar_si_ajeno() {
+            if [ "$(cat "$1/ref.txt" 2>/dev/null)" != "$2" ]; then
+              echo "::warning::$1 no corresponde a $2; se descarta."
+              rm -rf "$1"
+            fi
+          }
+          descartar_si_ajeno artefactos/tests-original "$MAIN"
+          descartar_si_ajeno artefactos/tests-nuestra "$SHA"
+          mkdir -p artefactos/tests-original artefactos/tests-nuestra
+          python3 scripts/dotech/comparar_junit.py --original artefactos/tests-original \
+            --nuestra artefactos/tests-nuestra --salida comparacion.json
+          python3 -I - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          sys.path.insert(0, "scripts/dotech")
+          from informe import alertas_del_entorno, estado_tests
+          comparacion = json.load(open("comparacion.json", encoding="utf-8"))
+          estado, descripcion = estado_tests(comparacion, False, None, alertas_del_entorno())
+          print(f"estado={estado}")
+          print(f"descripcion={descripcion}")
+          PY
+      - name: Publicar estados
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ESTADO: ${{ steps.atribuir.outputs.estado }}
+          DESCRIPCION: ${{ steps.atribuir.outputs.descripcion }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
+            -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
+            -f context=dotech/validacion-local -f description="Falta docling-validar en el Mac de Miguel"
+      - name: Marcar el fallo en el commit
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=failure \
+            -f context=dotech/tests -f description="No se pudieron atribuir los fallos de los tests" \
+            -f target_url="$ENLACE"

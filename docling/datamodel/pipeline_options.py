@@ -1,16 +1,25 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 import logging
+import os
+import warnings
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, ClassVar, Literal, Optional, Union
+from typing import Annotated, Any, ClassVar, Literal
 
 from docling_core.types.doc import PictureClassificationLabel
+from docling_core.types.doc.page import TextCellUnit
 from pydantic import (
     AnyUrl,
     BaseModel,
     ConfigDict,
     Field,
+    PositiveInt,
+    computed_field,
     field_validator,
+    model_validator,
 )
 from typing_extensions import deprecated
 
@@ -25,6 +34,7 @@ from docling.datamodel.accelerator_options import AcceleratorDevice, Accelerator
 from docling.datamodel.chart_extraction_options import (
     ChartExtractionModelKind,
     ChartExtractionModelOptions,
+    ChartExtractionVlmEngineOptions,
 )
 from docling.datamodel.extraction_options import ExtractionPromptStyle
 from docling.datamodel.kserve_v2_options import KserveV2OptionsMixin
@@ -70,6 +80,7 @@ from docling.models.inference_engines.object_detection.base import (
     ObjectDetectionEngineOptionsMixin,
 )
 from docling.models.inference_engines.vlm.base import VlmEngineOptionsMixin
+from docling.utils.ocr_language import OcrLanguageResolver
 
 _log = logging.getLogger(__name__)
 
@@ -88,6 +99,24 @@ class BaseOptions(BaseModel):
     """
 
     kind: ClassVar[str]
+
+
+class OcrMode(str, Enum):
+    r"""
+    How to generate the input for the OCR model
+    """
+
+    # Force OCR to work on the full page
+    FULL_PAGE = "full_page"
+
+    # Layout detections only. No PDF information is needed/used.
+    LAYOUT_REGIONS = "layout_regions"
+
+    # Eliminate those clusters that contain exclusively text PDF cells
+    PDF_AWARE_LAYOUT_REGIONS = "pdf_aware_layout_regions"
+
+    # Currently DEFAULT is wired to run PDF_AWARE_LAYOUT_REGIONS
+    DEFAULT = "default"
 
 
 class TableFormerMode(str, Enum):
@@ -175,27 +204,109 @@ class OcrOptions(BaseOptions):
         configurations.
     """
 
+    # Every concrete engine overrides this with its own discriminator
+    # The empty default keeps the abstract base instantiable
+    kind: ClassVar[str] = ""
+
+    # Whether `lang` is canonicalized, or handed to the engine verbatim
+    canonicalize_lang: ClassVar[bool] = True
+
+    mode: Annotated[
+        OcrMode,
+        Field(
+            description="Which document regions to feed as input to the OCR",
+            examples=[
+                OcrMode.FULL_PAGE,
+                OcrMode.LAYOUT_REGIONS,
+                OcrMode.PDF_AWARE_LAYOUT_REGIONS,
+                OcrMode.DEFAULT,
+            ],
+        ),
+    ] = OcrMode.DEFAULT
+
     lang: Annotated[
         list[str],
         Field(
-            description="List of OCR languages to use. The format must match the values of the OCR engine of choice.",
-            examples=[["deu", "eng"]],
+            description=(
+                "OCR languages, in order of preference."
+                " A language is written either as a native code of the OCR engine"
+                " (e.g. `deu`, `ch`, `script/Cyrillic`), which is handed to the engine untouched,"
+                f" or as a BCP-47 tag prefixed by '{OcrLanguageResolver._ISO_PREFIX}'."
+                " A tag is canonicalized to a language-script pair, so `iso:deu`, `iso:ger`,"
+                " `iso:de` and `iso:de-DE` are all `iso:de-Latn`."
+                " An empty list means the engine's own default, which for Tesseract is per-page"
+                " script detection."
+                " A language the selected engine has no model for raises an error"
+                " rather than falling back silently."
+            ),
+            examples=[["deu", "eng"], ["iso:zh-Hans"], []],
         ),
     ]
-    force_full_page_ocr: Annotated[
-        bool,
-        Field(
-            description="If enabled, a full-page OCR is always applied.",
-            examples=[False],
-        ),
-    ] = False
-    bitmap_area_threshold: Annotated[
+
+    scale: Annotated[
         float,
         Field(
-            description="Percentage of the page area for a bitmap to be processed with OCR.",
-            examples=[0.05, 0.1],
+            description=(
+                "Image scale multiplier applied before running OCR. The page is "
+                "rendered at 72 DPI times this factor, so the default 3 yields "
+                "216 DPI. Lower it when the source image is already high "
+                "resolution and upscaling degrades recognition."
+            ),
+            examples=[1.0, 3.0],
+            gt=0.0,
         ),
-    ] = 0.05
+    ] = 3.0
+
+    model_config = ConfigDict(
+        validate_assignment=True,
+        validate_default=True,
+    )
+
+    @field_validator("lang", mode="after")
+    @classmethod
+    def _canonicalize_lang(cls, value: list[str]) -> list[str]:
+        """Rewrite every entry into its canonical form.
+
+        Declared once on the base: pydantic collects field validators by field
+        name across the MRO, so it fires for the subclasses that redefine `lang`
+        with their own default -- unless they turn `canonicalize_lang` off, which
+        leaves `lang` exactly as the user wrote it.
+        """
+        if not cls.canonicalize_lang:
+            return value
+        return [
+            language.tag()
+            for language in OcrLanguageResolver.canonicalize_ocr_languages(value)
+        ]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_force_full_page_ocr(cls, data: Any) -> Any:
+        r"""
+        Accept the deprecated `force_full_page_ocr` constructor keyword and
+        translate it into the `mode` it is an old name for.
+        """
+        if isinstance(data, dict) and data.pop("force_full_page_ocr", False):
+            data["mode"] = OcrMode.FULL_PAGE
+        return data
+
+    # Deprecated: superseded by `OcrMode.FULL_PAGE`. Kept for backwards
+    # compatibility as a view over `mode`, so the two can never drift apart.
+    @computed_field(  # type: ignore[prop-decorator]
+        deprecated=(
+            "`force_full_page_ocr` is deprecated; set `mode=OcrMode.FULL_PAGE` instead."
+        ),
+        description="If enabled, a full-page OCR is always applied.",
+        examples=[False],
+    )
+    @property
+    def force_full_page_ocr(self) -> bool:
+        return self.mode is OcrMode.FULL_PAGE
+
+    @force_full_page_ocr.setter
+    def force_full_page_ocr(self, value: bool) -> None:
+        if value:
+            self.mode = OcrMode.FULL_PAGE
 
 
 class OcrAutoOptions(OcrOptions):
@@ -203,13 +314,16 @@ class OcrAutoOptions(OcrOptions):
 
     When this option is used, Docling probes the runtime environment at
     pipeline initialization and selects the best available OCR engine
-    (e.g., EasyOCR if GPU is present, Tesseract otherwise). Language
-    settings are deferred to the chosen engine's defaults.
+    (e.g., EasyOCR if GPU is present, Tesseract otherwise). The requested
+    languages are forwarded to whichever engine is chosen, and an engine with
+    no model for them is skipped in favour of the next candidate.
 
     Notes:
-        The `lang` field is intentionally defaulted to an empty list.
-        To control language selection, specify an explicit OCR engine
-        option class instead.
+        `lang` is forwarded to whichever engine is selected. The default empty
+        list means "each engine's own default model", so leaving it alone
+        reproduces the behaviour of picking that engine by hand. An engine that
+        cannot serve the requested language is treated as unavailable and the
+        next candidate is probed.
     """
 
     kind: ClassVar[Literal["auto"]] = "auto"
@@ -217,11 +331,19 @@ class OcrAutoOptions(OcrOptions):
         list[str],
         Field(
             description=(
-                "The automatic OCR engine will use the default values of the engine. Please specify the engine "
-                "explicitly to change the language selection."
-            )
+                "OCR languages forwarded to the automatically selected engine. A "
+                "bare code is the engine's own, so with no engine picked yet prefer "
+                "a BCP-47 tag behind the `iso:` prefix. The default empty list "
+                "leaves the choice of model to that engine. Engines with no model "
+                "for the requested language are skipped during selection."
+            ),
+            examples=[[], ["iso:de", "iso:en"]],
         ),
     ] = []
+
+
+# Inference backends RapidOCR supports
+RapidOcrBackend = Literal["onnxruntime", "openvino", "paddle", "torch"]
 
 
 class RapidOcrOptions(OcrOptions):
@@ -233,25 +355,49 @@ class RapidOcrOptions(OcrOptions):
     """
 
     kind: ClassVar[Literal["rapidocr"]] = "rapidocr"
-    # English and chinese are the most commonly used models and have been tested with RapidOCR.
     lang: Annotated[
         list[str],
         Field(
             description=(
-                "List of OCR languages. Note: RapidOCR currently supports 'english' and 'chinese' (default). "
-                "See RapidOCR documentation for other supported languages."
-            )
+                "Recognition language, written as a PP-OCR code (`ch`, `latin`, "
+                "`cyrillic`) or as a BCP-47 tag behind the `iso:` prefix. RapidOCR "
+                "runs a single language per run; if more than one is given the "
+                "first is used and the rest are ignored with a warning. A tag is "
+                "mapped onto a PP-OCR recognizer: PP-OCRv6 covers ~52 languages, "
+                "and a language PP-OCR serves only through a script-wide recognizer "
+                "routes to PP-OCRv5 (onnxruntime/openvino/paddle) or PP-OCRv4 "
+                "(torch). An empty list selects the Simplified Chinese default. "
+                "A language the resolved backend cannot serve raises an error "
+                "rather than falling back silently. The pre-canonicalization "
+                "docling spellings `chinese` and `english` still resolve to `ch` "
+                "and `en`, with a warning."
+            ),
+            examples=[["ch"], ["iso:zh-Hans"], ["cyrillic"]],
         ),
-    ] = ["chinese"]
+    ] = ["ch"]
     backend: Annotated[
-        Literal["onnxruntime", "openvino", "paddle", "torch"],
+        RapidOcrBackend,
         Field(
             description=(
                 "Inference backend for RapidOCR. Options: `onnxruntime` (default, cross-platform), `openvino` (Intel), "
-                "`paddle` (PaddlePaddle), `torch` (PyTorch). Choose based on your hardware and available libraries."
+                "`paddle` (PaddlePaddle), `torch` (PyTorch). Choose based on your hardware and available libraries. "
+                "Note: for languages outside the PP-OCRv6 set, `torch` is limited to the PP-OCRv4 script models while "
+                "the other backends use the wider PP-OCRv5 set (see `lang`)."
             )
         ),
     ] = "onnxruntime"
+    model_size: Annotated[
+        Literal["tiny", "small", "medium"],
+        Field(
+            description=(
+                "Detection/recognition model size for the PP-OCRv6 backbone. Only affects "
+                "languages that resolve to PP-OCRv6 (see `lang`); it has no effect on languages "
+                "served by PP-OCRv5/PP-OCRv4, and never affects the classification model. "
+                "An unsupported combination (e.g. `tiny` with Japanese) raises "
+                "`RapidOcrModelSizeNotSupportedError` rather than falling back silently."
+            )
+        ),
+    ] = "small"
     text_score: Annotated[
         float,
         Field(
@@ -262,19 +408,19 @@ class RapidOcrOptions(OcrOptions):
         ),
     ] = 0.5
     use_det: Annotated[
-        Optional[bool],
+        bool | None,
         Field(
             description="Enable text detection stage. If None, uses RapidOCR default behavior."
         ),
     ] = None
     use_cls: Annotated[
-        Optional[bool],
+        bool | None,
         Field(
             description="Enable text direction classification stage. If None, uses RapidOCR default behavior."
         ),
     ] = None
     use_rec: Annotated[
-        Optional[bool],
+        bool | None,
         Field(
             description="Enable text recognition stage. If None, uses RapidOCR default behavior."
         ),
@@ -286,38 +432,38 @@ class RapidOcrOptions(OcrOptions):
         ),
     ] = False
     det_model_path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description="Custom path to text detection model. If None, uses default RapidOCR model."
         ),
     ] = None
     cls_model_path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description="Custom path to text classification model. If None, uses default RapidOCR model."
         ),
     ] = None
     rec_model_path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description="Custom path to text recognition model. If None, uses default RapidOCR model."
         ),
     ] = None
     rec_keys_path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description="Custom path to recognition keys file. If None, uses default RapidOCR keys."
         ),
     ] = None
     rec_font_path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description="Deprecated. Use font_path instead.",
             deprecated=True,
         ),
     ] = None
     font_path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description="Custom path to font file for text rendering in visualization."
         ),
@@ -348,10 +494,21 @@ class NemotronOcrOptions(OcrOptions):
         list[str],
         Field(
             description=(
-                "List of OCR languages. nemotron-OCR-v2 supports 'english' and 'multilingual'"
-            )
+                "Recognition language, written as one of nemotron-OCR's own codes "
+                "(`english`, `multilingual`) or as a BCP-47 tag behind the `iso:` "
+                "prefix. nemotron-OCR-v2 ships two recognizers: `english`, "
+                "`iso:en` and an empty list all select the English model, while "
+                "`multilingual` and the languages that model covers (`iso:zh-Hans`, "
+                "`iso:zh-Hant`, `iso:ja`, `iso:ko`, `iso:ru`) select the "
+                "multilingual one. Any other Latin-script language whose alphabet "
+                "the English recognizer can spell (`iso:de`, `iso:fr`, `iso:pl`, "
+                "`iso:sr-Latn`, ...) is routed to the English model as a best "
+                "effort, with a warning: NVIDIA validates none of them. A language "
+                "that model cannot spell raises"
+            ),
+            examples=[["english"], ["multilingual"]],
         ),
-    ] = []
+    ] = ["english"]
     merge_level: Annotated[
         Literal["word", "sentence", "paragraph"],
         Field(
@@ -383,13 +540,19 @@ class EasyOcrOptions(OcrOptions):
         list[str],
         Field(
             description=(
-                "List of language codes for OCR. EasyOCR supports 80+ languages. Use ISO 639-1 codes "
-                "(e.g., `en`, `fr`, `de`). Multiple languages can be specified for multilingual documents."
-            )
+                "OCR languages, written as EasyOCR's own codes (`en`, `ch_sim`, "
+                "`ang`) or as BCP-47 tags behind the `iso:` prefix. EasyOCR covers "
+                "80+ languages and runs several at once, but they must share a "
+                "recognition model, so keep the list short and script-consistent. "
+                "Each language is routed to the recognition network of its script, "
+                "so `ru` reaches the Cyrillic model. EasyOCR has no multilingual "
+                "model -- list the languages explicitly."
+            ),
+            examples=[["en", "es", "fr", "de"], ["ru", "uk"]],
         ),
-    ] = ["fr", "de", "es", "en"]
+    ] = ["en", "es", "fr", "de"]
     use_gpu: Annotated[
-        Optional[bool],
+        bool | None,
         Field(
             description=(
                 "Enable GPU acceleration for EasyOCR. If None, automatically detects and uses GPU if available. "
@@ -407,7 +570,7 @@ class EasyOcrOptions(OcrOptions):
         ),
     ] = 0.5
     model_storage_directory: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description=(
                 "Directory path for storing downloaded EasyOCR models. If None, uses default EasyOCR cache location. "
@@ -416,7 +579,7 @@ class EasyOcrOptions(OcrOptions):
         ),
     ] = None
     recog_network: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description=(
                 "Recognition network architecture to use. Options: `standard` (default, balanced), `craft` (higher "
@@ -456,11 +619,19 @@ class TesseractCliOcrOptions(OcrOptions):
         list[str],
         Field(
             description=(
-                "List of Tesseract language codes. Use 3-letter ISO 639-2 codes (e.g., `eng`, `fra`, `deu`). "
-                "Multiple languages enable multilingual OCR. Requires corresponding Tesseract language data files."
-            )
+                "OCR languages, written as the stems of the installed tessdata "
+                "files (`deu`, `chi_tra`, `script/Cyrillic`, a traineddata file of "
+                "your own) or as BCP-47 tags behind the `iso:` prefix, which are "
+                "mapped onto those files (`iso:de` becomes `deu`, `iso:zh-Hant` "
+                "becomes `chi_tra`). Multiple languages enable multilingual OCR and "
+                "are joined in the order given, which Tesseract treats as "
+                "preference order. An empty list runs orientation and script "
+                "detection per page (requires the `osd` traineddata). Languages "
+                "without an installed traineddata file raise at construction time."
+            ),
+            examples=[["eng", "deu"], ["iso:fr", "iso:de"], []],
         ),
-    ] = ["fra", "deu", "spa", "eng"]
+    ] = ["eng", "spa", "fra", "deu"]
     tesseract_cmd: Annotated[
         str,
         Field(
@@ -471,7 +642,7 @@ class TesseractCliOcrOptions(OcrOptions):
         ),
     ] = "tesseract"
     path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description=(
                 "Path to Tesseract data directory containing language files. If None, uses Tesseract's default "
@@ -480,7 +651,7 @@ class TesseractCliOcrOptions(OcrOptions):
         ),
     ] = None
     psm: Annotated[
-        Optional[int],
+        int | None,
         Field(
             description=(
                 "Page Segmentation Mode for Tesseract. Values 0-13 control how Tesseract segments the page. "
@@ -501,13 +672,21 @@ class TesseractOcrOptions(OcrOptions):
         list[str],
         Field(
             description=(
-                "List of Tesseract language codes. Use 3-letter ISO 639-2 codes (e.g., `eng`, `fra`, `deu`). "
-                "Multiple languages enable multilingual OCR. Requires corresponding Tesseract language data files."
-            )
+                "OCR languages, written as the stems of the installed tessdata "
+                "files (`deu`, `chi_tra`, `script/Cyrillic`, a traineddata file of "
+                "your own) or as BCP-47 tags behind the `iso:` prefix, which are "
+                "mapped onto those files (`iso:de` becomes `deu`, `iso:zh-Hant` "
+                "becomes `chi_tra`). Multiple languages enable multilingual OCR and "
+                "are joined in the order given, which Tesseract treats as "
+                "preference order. An empty list runs orientation and script "
+                "detection per page (requires the `osd` traineddata). Languages "
+                "without an installed traineddata file raise at construction time."
+            ),
+            examples=[["eng", "deu"], ["iso:fr", "iso:de"], []],
         ),
-    ] = ["fra", "deu", "spa", "eng"]
+    ] = ["eng", "spa", "fra", "deu"]
     path: Annotated[
-        Optional[str],
+        str | None,
         Field(
             description=(
                 "Path to Tesseract data directory containing language files. If None, uses Tesseract's default "
@@ -516,7 +695,7 @@ class TesseractOcrOptions(OcrOptions):
         ),
     ] = None
     psm: Annotated[
-        Optional[int],
+        int | None,
         Field(
             description=(
                 "Page Segmentation Mode for Tesseract. Values 0-13 control how Tesseract segments the page. "
@@ -537,11 +716,15 @@ class OcrMacOptions(OcrOptions):
         list[str],
         Field(
             description=(
-                "List of language locale codes for macOS OCR. Use format `language-REGION` (e.g., `en-US`, `fr-FR`). "
-                "Leverages native macOS Vision framework for OCR on Apple platforms."
-            )
+                "OCR languages, written as the recognition languages the running "
+                "macOS reports (`en-US`, `zh-Hans`) or as BCP-47 tags behind the "
+                "`iso:` prefix, which are matched against them (`iso:de` becomes "
+                "`de-DE`, `iso:pt` becomes `pt-BR`). An empty list hands the choice "
+                "to Vision's own automatic behaviour."
+            ),
+            examples=[["en-US", "de-DE"], ["iso:fr", "iso:de"], []],
         ),
-    ] = ["fr-FR", "de-DE", "es-ES", "en-US"]
+    ] = ["en-US", "es-ES", "fr-FR", "de-DE"]
     recognition: Annotated[
         str,
         Field(
@@ -583,6 +766,10 @@ class KserveV2OcrOptions(OcrOptions, KserveV2OptionsMixin):
 
     kind: ClassVar[Literal["kserve_v2_ocr"]] = "kserve_v2_ocr"
 
+    # The deployed model is the only authority on the languages it serves, and
+    # docling cannot inspect it, so `lang` is neither validated nor mapped here.
+    canonicalize_lang: ClassVar[bool] = False
+
     model_name: str = Field(
         default="ocr",
         description="Remote model name registered in the KServe v2 endpoint.",
@@ -593,8 +780,8 @@ class KserveV2OcrOptions(OcrOptions, KserveV2OptionsMixin):
         Field(
             description=(
                 "List of OCR languages. Note: Language selection depends on the deployed model. "
-                "This parameter is passed to the server but may not be used by all models."
-            )
+            ),
+            examples=[["english"], ["chinese"]],
         ),
     ] = ["english", "chinese"]
 
@@ -665,7 +852,7 @@ class PictureDescriptionBaseOptions(BaseOptions):
         ),
     ] = 0.05
     classification_allow: Annotated[
-        Optional[list[PictureClassificationLabel]],
+        list[PictureClassificationLabel] | None,
         Field(
             description=(
                 "List of picture classification labels to allow for description. Only pictures classified with these "
@@ -675,7 +862,7 @@ class PictureDescriptionBaseOptions(BaseOptions):
         ),
     ] = None
     classification_deny: Annotated[
-        Optional[list[PictureClassificationLabel]],
+        list[PictureClassificationLabel] | None,
         Field(
             description=(
                 "List of picture classification labels to exclude from description. Pictures classified with these "
@@ -951,7 +1138,7 @@ class VlmConvertOptions(StagePresetMixin, VlmEngineOptionsMixin, BaseModel):
         default=2.0, description="Image scaling factor for preprocessing"
     )
 
-    max_size: Optional[int] = Field(
+    max_size: int | None = Field(
         default=None, description="Maximum image dimension (width or height)"
     )
 
@@ -987,7 +1174,7 @@ class CodeFormulaVlmOptions(StagePresetMixin, VlmEngineOptionsMixin, BaseModel):
         default=2.0, description="Image scaling factor for preprocessing"
     )
 
-    max_size: Optional[int] = Field(
+    max_size: int | None = Field(
         default=None, description="Maximum image dimension (width or height)"
     )
 
@@ -995,6 +1182,28 @@ class CodeFormulaVlmOptions(StagePresetMixin, VlmEngineOptionsMixin, BaseModel):
 
     extract_formulas: bool = Field(
         default=True, description="Extract mathematical formulas"
+    )
+
+    expansion_factor: float = Field(
+        default=0.18,
+        ge=0.0,
+        description=(
+            "Margin added around each code or formula element when it is cropped "
+            "from the page, as a fraction of the element's width (left and right) "
+            "and height (top and bottom). A wide margin can take in an equation "
+            "number or a neighbouring line, which can make the model loop."
+        ),
+    )
+
+    stop_on_repetition: bool = Field(
+        default=True,
+        description=(
+            "Stop a generation that keeps repeating the same short unit (for "
+            "example `\\quad \\quad ...`) instead of running to max_new_tokens, and "
+            "remove the repeated tail from the output. Inline engines stop the "
+            "looping element early; for API and vLLM engines only the output is "
+            "cleaned up."
+        ),
     )
 
 
@@ -1012,6 +1221,8 @@ VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_GOT_OCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_PHI4)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_QWEN)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_NANONETS_OCR2)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_NEMOTRON_PARSE_V2)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_MINERU2_PRO)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_GEMMA_12B)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_GEMMA_27B)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_DOLPHIN)
@@ -1019,6 +1230,7 @@ VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_GLMOCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_LIGHTONOCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_FALCON_OCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_CHANDRA_OCR2)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_UNLIMITED_OCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_DOTS_OCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_DOTS_MOCR)
 
@@ -1037,7 +1249,6 @@ PictureDescriptionVlmEngineOptions.register_preset(stage_model_specs.PICTURE_DES
 # Register CodeFormula presets
 CodeFormulaVlmOptions.register_preset(stage_model_specs.CODE_FORMULA_CODEFORMULAV2)
 CodeFormulaVlmOptions.register_preset(stage_model_specs.CODE_FORMULA_GRANITE_DOCLING)
-
 
 # =============================================================================
 # MODULE-LEVEL DEFAULTS FOR NEW PRESET SYSTEM
@@ -1064,6 +1275,12 @@ _default_picture_classification_options = DocumentPictureClassifierOptions.from_
 _default_code_formula_options = CodeFormulaVlmOptions.from_preset("codeformulav2")
 """Default code/formula options using codeformulav2 preset with AUTO_INLINE runtime."""
 
+# Default ChartExtractionVlmEngineOptions using granite_vision_v4 preset
+_default_chart_extraction_options = ChartExtractionVlmEngineOptions.from_preset(
+    "granite_vision_v4"
+)
+"""Default chart extraction options using granite_vision_v4 with automatic runtime selection."""
+
 
 # Define an enum for the backend options
 class PdfBackend(str, Enum):
@@ -1076,21 +1293,20 @@ class PdfBackend(str, Enum):
     Attributes:
         PYPDFIUM2: Standard PDF parser using PyPDFium2 library. Fast and
             reliable for basic text extraction.
-        DOCLING_PARSE: Docling Parse backend providing enhanced layout
-            analysis, structure preservation, and advanced table detection.
-            This is the recommended backend for most use cases.
+        DOCLING_PARSE: Deprecated. Maps to `THREADED_DOCLING_PARSE`.
         THREADED_DOCLING_PARSE: Threaded Docling Parse backend optimized for
-            concurrent page parsing in the standard PDF pipeline.
-        DLPARSE_V1: Deprecated. Maps to `DOCLING_PARSE`.
-        DLPARSE_V2: Deprecated. Maps to `DOCLING_PARSE`.
-        DLPARSE_V4: Deprecated. Maps to `DOCLING_PARSE`.
+            concurrent page parsing in the standard PDF pipeline. This is the
+            default and recommended backend for most use cases.
+        DLPARSE_V1: Deprecated. Maps to `THREADED_DOCLING_PARSE`.
+        DLPARSE_V2: Deprecated. Maps to `THREADED_DOCLING_PARSE`.
+        DLPARSE_V4: Deprecated. Maps to `THREADED_DOCLING_PARSE`.
     """
 
     PYPDFIUM2 = "pypdfium2"
-    DOCLING_PARSE = "docling_parse"
-    THREADED_DOCLING_PARSE = "threaded_docling_parse"
+    THREADED_DOCLING_PARSE = "docling_parse"  # we use `docling_parse` as a short hand for the `threaded_docling_parse` (pointing to DoclingThreadedPdfParser). We do not support the single threaded DoclingPdfParser (the original `docling_parse`) from docling-parse!
 
-    # Deprecated - these map to DOCLING_PARSE
+    # Deprecated - these map to THREADED_DOCLING_PARSE
+    DOCLING_PARSE = "_docling_parse"  # deprecated (added _ to name to signal this)
     DLPARSE_V1 = "dlparse_v1"  # deprecated
     DLPARSE_V2 = "dlparse_v2"  # deprecated
     DLPARSE_V4 = "dlparse_v4"  # deprecated
@@ -1111,14 +1327,16 @@ def normalize_pdf_backend(backend: PdfBackend) -> PdfBackend:
     import warnings
 
     deprecated_mapping = {
-        PdfBackend.DLPARSE_V1: PdfBackend.DOCLING_PARSE,
-        PdfBackend.DLPARSE_V2: PdfBackend.DOCLING_PARSE,
-        PdfBackend.DLPARSE_V4: PdfBackend.DOCLING_PARSE,
+        PdfBackend.DOCLING_PARSE: PdfBackend.THREADED_DOCLING_PARSE,
+        PdfBackend.DLPARSE_V1: PdfBackend.THREADED_DOCLING_PARSE,
+        PdfBackend.DLPARSE_V2: PdfBackend.THREADED_DOCLING_PARSE,
+        PdfBackend.DLPARSE_V4: PdfBackend.THREADED_DOCLING_PARSE,
     }
 
     if backend in deprecated_mapping:
         warnings.warn(
-            f"PdfBackend.{backend.name} was previously deprecated and removed in this docling version. Using PdfBackend.DOCLING_PARSE instead. ",
+            f"PdfBackend.{backend.name} is deprecated; using "
+            "PdfBackend.THREADED_DOCLING_PARSE instead.",
             DeprecationWarning,
             stacklevel=3,
         )
@@ -1169,7 +1387,7 @@ class PipelineOptions(BaseOptions):
     """
 
     document_timeout: Annotated[
-        Optional[float],
+        float | None,
         Field(
             description=(
                 "Maximum processing time in seconds before aborting document conversion. When exceeded, the pipeline "
@@ -1211,7 +1429,7 @@ class PipelineOptions(BaseOptions):
         ),
     ] = False
     artifacts_path: Annotated[
-        Optional[Union[Path, str]],
+        Path | str | None,
         Field(
             description=(
                 "Local directory containing pre-downloaded model artifacts (weights, configs). If None, models are "
@@ -1269,7 +1487,7 @@ class ConvertPipelineOptions(PipelineOptions):
             description=(
                 "Configuration for picture description model. Uses new preset system (recommended). "
                 "Default: 'smolvlm' preset. Only applicable when `do_picture_description=True`. "
-                "Example: PictureDescriptionVlmOptions.from_preset('granite_vision')"
+                "Example: PictureDescriptionVlmEngineOptions.from_preset('granite_vision')"
             ),
         ),
     ] = _default_picture_description_options
@@ -1285,14 +1503,16 @@ class ConvertPipelineOptions(PipelineOptions):
         ),
     ] = False
     chart_extraction_options: Annotated[
-        ChartExtractionModelOptions,
+        ChartExtractionVlmEngineOptions,
         Field(
             description=(
-                "Configuration for the chart extraction model, including which model variant to use "
-                "and which output formats to generate (CSV, code, summary)."
+                "Configuration for the chart extraction stage. "
+                "Use ChartExtractionVlmEngineOptions.from_preset('granite_vision_v4') "
+                "(default) or from_preset('granite_vision_v3_3') for the CSV-only model. "
+                "Controls which output formats are generated (chart2csv, chart2summary, chart2code)."
             )
         ),
-    ] = ChartExtractionModelOptions()
+    ] = _default_chart_extraction_options
 
 
 class PaginatedPipelineOptions(ConvertPipelineOptions):
@@ -1371,7 +1591,7 @@ class VlmPipelineOptions(PaginatedPipelineOptions):
         ),
     ] = False
     vlm_options: Annotated[
-        Union[VlmConvertOptions, InlineVlmOptions, ApiVlmOptions],
+        VlmConvertOptions | InlineVlmOptions | ApiVlmOptions,
         Field(
             description=(
                 "Vision-Language Model configuration for document understanding. Uses new VlmConvertOptions "
@@ -1391,9 +1611,9 @@ class BaseLayoutOptions(BaseOptions):
     for empty-cluster retention and cell-assignment skipping.
 
     See Also:
-        `LayoutOptions`: Default layout model configuration (Heron).
-        `LayoutObjectDetectionOptions`: Object-detection runtime layout
-            with preset support.
+        `LayoutObjectDetectionOptions`: Default layout options; object-detection
+            runtime with preset support.
+        `LayoutOptions`: Deprecated predecessor, translated onto the above.
     """
 
     keep_empty_clusters: Annotated[
@@ -1414,22 +1634,6 @@ class BaseLayoutOptions(BaseOptions):
             )
         ),
     ] = False
-
-
-class LayoutOptions(BaseLayoutOptions):
-    """Options for layout processing using Docling's built-in layout model.
-
-    Provides configuration for the default layout analysis path, including
-    model selection (e.g., Heron, Egret variants) and orphan cluster
-    creation for elements not assigned to any detected structure.
-
-    Notes:
-        The default model is ``DOCLING_LAYOUT_HERON``. For higher accuracy
-        on complex documents, consider ``DOCLING_LAYOUT_EGRET_LARGE`` or
-        ``DOCLING_LAYOUT_EGRET_XLARGE``.
-    """
-
-    kind: ClassVar[str] = "docling_layout_default"
     create_orphan_clusters: Annotated[
         bool,
         Field(
@@ -1439,6 +1643,30 @@ class LayoutOptions(BaseLayoutOptions):
             )
         ),
     ] = True
+
+
+class LayoutOptions(BaseLayoutOptions):
+    """Deprecated. Use `LayoutObjectDetectionOptions` instead.
+
+    Retained so existing code keeps working: it still constructs, still
+    selects any of the supported layout models, and is translated onto
+    `LayoutObjectDetectionOptions` by the `LayoutModel` shim.
+
+    Notes:
+        ``DOCLING_LAYOUT_V2`` is no longer supported and falls back to
+        ``DOCLING_LAYOUT_HERON`` with a warning.
+
+        Removing this class also retires `layout_model_specs` (including every
+        ``DOCLING_LAYOUT_*`` constant and `LayoutModelConfig`) and the
+        `models/stages/layout/layout_model.py` shim, which exist solely to
+        serve it.
+
+    Example:
+        >>> LayoutObjectDetectionOptions.from_preset("layout_heron_default")
+    """
+
+    kind: ClassVar[str] = "docling_layout_default"
+
     model_spec: Annotated[
         LayoutModelConfig,
         Field(
@@ -1449,6 +1677,16 @@ class LayoutOptions(BaseLayoutOptions):
         ),
     ] = DOCLING_LAYOUT_HERON
 
+    def model_post_init(self, context: Any, /) -> None:
+        super().model_post_init(context)
+        warnings.warn(
+            "LayoutOptions is deprecated and will be removed in a future release. "
+            "Use LayoutObjectDetectionOptions, e.g. "
+            'LayoutObjectDetectionOptions.from_preset("layout_heron_default").',
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
 
 class LayoutObjectDetectionOptions(
     ObjectDetectionStagePresetMixin,
@@ -1457,27 +1695,20 @@ class LayoutObjectDetectionOptions(
 ):
     """Options for layout detection using object-detection runtimes.
 
-    Alternative to `LayoutOptions` that uses the pluggable object-detection
-    engine system with preset support via `ObjectDetectionStagePresetMixin`.
-    Use ``from_preset()`` to create instances from registered model presets.
+    The default layout options. Uses the pluggable object-detection engine
+    system with preset support via `ObjectDetectionStagePresetMixin`; use
+    ``from_preset()`` to create instances from registered model presets.
 
     Notes:
-        Orphan cluster creation is disabled by default (unlike
-        `LayoutOptions`). Enable ``create_orphan_clusters`` if unassigned
-        elements must be preserved.
+        The default model is ``layout_heron_default``. For higher accuracy on
+        complex documents, consider the ``layout_egret_large`` or
+        ``layout_egret_xlarge`` presets.
+
+    Example:
+        >>> LayoutObjectDetectionOptions.from_preset("layout_egret_large")
     """
 
     kind: ClassVar[str] = "layout_object_detection"
-
-    create_orphan_clusters: Annotated[
-        bool,
-        Field(
-            description=(
-                "Create clusters for orphaned elements not assigned to any structure. When True, isolated text or "
-                "elements are grouped into their own clusters. Recommended for complete document coverage."
-            )
-        ),
-    ] = False
 
     model_spec: ObjectDetectionModelSpec = Field(
         default_factory=lambda: (
@@ -1492,6 +1723,76 @@ class LayoutObjectDetectionOptions(
 LayoutObjectDetectionOptions.register_preset(
     stage_model_specs.OBJECT_DETECTION_LAYOUT_HERON
 )
+LayoutObjectDetectionOptions.register_preset(
+    stage_model_specs.OBJECT_DETECTION_LAYOUT_HERON_101
+)
+LayoutObjectDetectionOptions.register_preset(
+    stage_model_specs.OBJECT_DETECTION_LAYOUT_EGRET_MEDIUM
+)
+LayoutObjectDetectionOptions.register_preset(
+    stage_model_specs.OBJECT_DETECTION_LAYOUT_EGRET_LARGE
+)
+LayoutObjectDetectionOptions.register_preset(
+    stage_model_specs.OBJECT_DETECTION_LAYOUT_EGRET_XLARGE
+)
+
+
+class BaseLayoutPostprocessorOptions(BaseOptions):
+    """Algorithm parameters consumed by ``LayoutPostprocessor``.
+
+    These controls drive the post-processing of raw layout clusters
+    (cell assignment, empty-cluster handling, orphan-cluster creation).
+    They are decoupled from the layout (prediction) options so the
+    post-processing stage and the predictor models can evolve
+    independently.
+    """
+
+    keep_empty_clusters: Annotated[
+        bool,
+        Field(
+            description=(
+                "Retain empty clusters in layout analysis results. When False, clusters without content are removed."
+            )
+        ),
+    ] = False
+    skip_cell_assignment: Annotated[
+        bool,
+        Field(
+            description=(
+                "Skip assignment of cells to clusters during layout post-processing. When True, cells are detected "
+                "but not associated with clusters."
+            )
+        ),
+    ] = False
+    create_orphan_clusters: Annotated[
+        bool,
+        Field(
+            description=(
+                "Create clusters for orphaned elements not assigned to any structure."
+            )
+        ),
+    ] = True
+
+
+class LayoutPostprocessorOptions(BaseLayoutPostprocessorOptions):
+    """Stage options for ``LayoutPostprocessingModel``.
+
+    Extends the algorithm parameters with the stage-level toggle
+    ``run_postprocessor``. When disabled, the stage only computes the
+    layout confidence score and leaves the raw clusters untouched
+    (used by the table-crops layout model).
+    """
+
+    kind: ClassVar[str] = "layout_postprocessor"
+    run_postprocessor: Annotated[
+        bool,
+        Field(
+            description=(
+                "Run the layout post-processor. When False, raw clusters are passed through unchanged and only the "
+                "layout confidence score is computed."
+            )
+        ),
+    ] = True
 
 
 class AsrPipelineOptions(PipelineOptions):
@@ -1563,8 +1864,17 @@ class VideoPipelineOptions(PipelineOptions):
 
     max_sampled_frames: Annotated[
         int | None,
-        Field(default=None, gt=0, description="Optional cap on sampled frames."),
-    ] = None
+        Field(
+            default=200,
+            gt=0,
+            description=(
+                "Maximum number of frames sampled per video; sampling stops once it "
+                "is reached. The default of 200 bounds memory and output size "
+                "(about 33 minutes at the default 10 s interval). Set to None for "
+                "no limit."
+            ),
+        ),
+    ] = 200
 
     scene_change_smooth_window: Annotated[
         int,
@@ -1702,20 +2012,46 @@ class HeadingHierarchyOptions(BaseModel):
         bool,
         Field(
             description=(
-                "Use font size (approximated from parsed PDF cell heights) as a fallback for "
-                "headings without recognizable numbering. Requires "
-                "`generate_parsed_pages=True`."
+                "Use the visual style of the heading (font size, and with `use_font_style` also "
+                "weight, slant and letter case) as a fallback for headings without recognizable "
+                "numbering. Requires `generate_parsed_pages=True`."
             )
         ),
     ] = True
+    use_font_style: Annotated[
+        bool,
+        Field(
+            description=(
+                "Refine the style fallback with the font weight and slant read from the embedded "
+                "PDF font names, plus all-caps detection, so that headings sharing a font size "
+                "are still ranked (bold above regular, upright above italic, all-caps above "
+                "mixed case). Ignored when `use_style` is disabled; font names that carry no "
+                "recognizable styling fall back to font size alone."
+            )
+        ),
+    ] = True
+    style_size_tolerance: Annotated[
+        float,
+        Field(
+            ge=0.0,
+            le=1.0,
+            description=(
+                "Relative difference below which two heading font sizes are treated as one size "
+                "by the style fallback. The size of a heading is measured from its cells, so the "
+                "same font measures a little taller on a heading that has descenders; without "
+                "this tolerance such headings would land on different levels. Higher = more "
+                "sizes collapse into one level."
+            ),
+        ),
+    ] = 0.05
     numbering_schemes: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         Field(
             description=(
                 "Optional override of the numbering-scheme precedence (highest level first). "
-                "Known schemes: 'part', 'chapter', 'article', 'roman_u', 'arabic', "
-                "'alpha_u', 'alpha_l', 'roman_l'. When None, a default legal/regulatory "
-                "ordering is used."
+                "Known schemes: 'part', 'chapter', 'division', 'subdivision', 'article', "
+                "'roman_u', 'arabic', 'alpha_u', 'alpha_l', 'roman_l'. When None, a default "
+                "legal/regulatory ordering is used."
             )
         ),
     ] = None
@@ -1832,7 +2168,7 @@ class PdfPipelineOptions(PaginatedPipelineOptions):
                 "Specifies which layout model to use (default: Heron)."
             )
         ),
-    ] = LayoutOptions()
+    ] = Field(default_factory=LayoutObjectDetectionOptions)
     code_formula_options: Annotated[
         CodeFormulaVlmOptions,
         Field(
@@ -1890,6 +2226,16 @@ class PdfPipelineOptions(PaginatedPipelineOptions):
             )
         ),
     ] = False
+    use_reading_order_separators: Annotated[
+        bool,
+        Field(
+            description=(
+                "Use visible horizontal and vertical PDF rules as structural signals "
+                "for rule-based reading order. This only affects PDF backends that "
+                "expose visible shape geometry."
+            )
+        ),
+    ] = True
     heading_hierarchy_options: Annotated[
         HeadingHierarchyOptions,
         Field(
@@ -1958,6 +2304,17 @@ class PdfPipelineOptions(PaginatedPipelineOptions):
             )
         ),
     ] = 100
+    # Shutdown control
+    stage_shutdown_timeout_seconds: Annotated[
+        float,
+        Field(
+            description=(
+                "Seconds to wait for each pipeline stage thread to terminate during shutdown before it is "
+                "abandoned as stuck (its resources may then leak for the rest of the process lifetime). Only "
+                "used by `StandardPdfPipeline` (threaded mode)."
+            )
+        ),
+    ] = 15.0
 
 
 class ProcessingPipeline(str, Enum):
@@ -1969,12 +2326,14 @@ class ProcessingPipeline(str, Enum):
     Attributes:
         LEGACY: Legacy pipeline for backward compatibility with older document processing workflows.
         STANDARD: Standard pipeline for general document processing (PDF, DOCX, images, etc.) with layout analysis.
+        NATIVE: Model-free pipeline extracting the native text and images of a PDF with docling-parse.
         VLM: Vision-Language Model pipeline for advanced document understanding using multimodal AI models.
         ASR: Automatic Speech Recognition pipeline for audio and video transcription to text.
     """
 
     LEGACY = "legacy"
     STANDARD = "standard"
+    NATIVE = "native"
     VLM = "vlm"
     ASR = "asr"
 
@@ -1991,3 +2350,68 @@ class ThreadedPdfPipelineOptions(PdfPipelineOptions):
     See Also:
         `PdfPipelineOptions`: Base class with all batch and queue settings.
     """
+
+
+def default_parser_threads() -> int:
+    """All but one of the machine's CPU threads, so the machine stays responsive."""
+    return max(1, (os.cpu_count() or 2) - 1)
+
+
+class NativePdfPipelineOptions(PaginatedPipelineOptions):
+    """Pipeline options for the native (model-free) PDF pipeline.
+
+    The native pipeline reads what is already encoded in the PDF: the text cells
+    and the embedded bitmap images reported by docling-parse. It runs no layout,
+    OCR or table-structure model, so conversion is fast but the resulting
+    `DoclingDocument` carries one plain `TextItem` per text cell in the parser's
+    order, without reading order, headings or tables.
+
+    Note:
+        Native picture images additionally require the PDF backend to decode the
+        embedded bitmaps (`PdfBackendOptions.include_bitmap_images=True`);
+        without it, pictures are still emitted, but only with their bounding box.
+
+    See Also:
+        `PdfPipelineOptions`: Full PDF pipeline with layout, OCR and tables.
+    """
+
+    text_cell_unit: Annotated[
+        TextCellUnit,
+        Field(
+            description=(
+                "Granularity of the native text cells emitted as text items: one item per line "
+                "(default), per word, or per character. The PDF backend must materialize the "
+                "requested cell unit; the docling-parse backends materialize words and lines."
+            )
+        ),
+    ] = TextCellUnit.LINE
+    parser_threads: Annotated[
+        PositiveInt,
+        Field(
+            description=(
+                "Number of PDF parser worker threads. This is the only parallelism this "
+                "pipeline has, since it runs no model: `accelerator_options` governs model "
+                "inference and is unused here. Defaults to all but one of the machine's "
+                "CPU threads."
+            ),
+        ),
+    ] = Field(default_factory=default_parser_threads)
+    generate_picture_images: Annotated[
+        bool,
+        Field(
+            description=(
+                "Attach the embedded bitmap images of the PDF to the picture items. Requires a "
+                "PDF backend configured with `include_bitmap_images=True`."
+            )
+        ),
+    ] = True
+    generate_page_images: Annotated[
+        bool,
+        Field(
+            description=(
+                "Attach a rendered image of every page to the document. Page images are produced "
+                "by rasterizing the page, so the pipeline parses *and* renders each page, at "
+                "`images_scale` pixels per point. Disable it to parse only, which is faster."
+            )
+        ),
+    ] = True

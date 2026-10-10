@@ -1,0 +1,115 @@
+# Una corrida de tests de un lado (el original o nuestra rama). La llaman
+# dotech-vigia y dotech-abrir-solicitud. Nunca arranca por eventos de terceros.
+#
+# Ejecuta el árbol probado (y sus scripts dotech): por eso no recibe ningún
+# secreto, solo el GITHUB_TOKEN de lectura, y no guarda credenciales en git.
+name: dotech-pruebas
+
+on:
+  workflow_call:
+    inputs:
+      lado:
+        description: "original | nuestra"
+        type: string
+        required: true
+      repositorio:
+        description: "Repositorio del árbol a probar"
+        type: string
+        required: true
+      ref:
+        description: "Tag o commit del árbol a probar"
+        type: string
+        required: true
+      sha_nuestra:
+        description: "Commit de nuestra rama (de ahí salen los scripts dotech)"
+        type: string
+        required: true
+      evaluar_sobra:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  pruebas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      LADO: ${{ inputs.lado }}
+    steps:
+      - name: Árbol a probar
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repositorio }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Scripts dotech
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.sha_nuestra }}
+          path: .dotech-src
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Los resultados van a un directorio limpio fuera del árbol. ref.txt dice qué
+      # commit se probó: el artefacto se sube aunque todo lo demás falle, así que una
+      # corrida rota reemplaza al artefacto de un intento anterior en vez de dejarlo
+      # pasar por bueno.
+      - name: Directorio de resultados
+        run: |
+          rm -rf "$RUNNER_TEMP/resultados"
+          mkdir -p "$RUNNER_TEMP/resultados"
+          git rev-parse HEAD > "$RUNNER_TEMP/resultados/ref.txt"
+
+      - name: Entorno (el mismo que usa el original en su CI)
+        uses: ./.github/actions/setup-ubuntu-ci
+        with:
+          python_version: "3.12"
+          uv_sync_args: --frozen --group dev --all-extras --all-packages --no-group docs --no-group examples
+          install_system_deps: "true"
+          cache_models: "true"
+
+      # Los dos lados escriben con -o junit_logging=system-out y sin -s: sin la
+      # salida capturada no se desglosa la tabla del e2e y un fallo nuestro se
+      # escondería como «del original».
+      - name: Tests ligeros y prueba completa de conversión
+        run: |
+          r="$RUNNER_TEMP/resultados"
+          if ! uv run --no-sync python .github/scripts/pytest_marker_selection.py core-ignore-args > "$RUNNER_TEMP/ignorar.txt"; then
+            echo "::error::No se pudo calcular qué módulos excluir de los tests ligeros."
+            exit 1
+          fi
+          mapfile -t ML_IGNORE_ARGS < "$RUNNER_TEMP/ignorar.txt"
+          set +e
+          uv run --no-sync pytest -q -p no:cacheprovider -o junit_logging=system-out \
+            --junitxml="$r/junit-core.xml" "${ML_IGNORE_ARGS[@]}"
+          uv run --no-sync pytest -q -p no:cacheprovider -o junit_logging=system-out \
+            --junitxml="$r/junit-e2e.xml" tests/test_e2e_conversion.py
+          if [ "$LADO" = "nuestra" ]; then
+            uv run --no-sync pytest -q -p no:cacheprovider -o junit_logging=system-out \
+              --junitxml="$r/junit-dotech.xml" scripts/dotech/tests
+          fi
+          exit 0
+
+      # Los modelos ya se bajaron en los pasos anteriores; sin modo offline un test
+      # puede quedarse esperando a Hugging Face hasta el timeout.
+      - name: ¿Sobra algún arreglo?
+        if: inputs.evaluar_sobra
+        env:
+          HF_HUB_OFFLINE: "1"
+          TRANSFORMERS_OFFLINE: "1"
+        run: |
+          uv run --no-sync python .dotech-src/scripts/dotech/sobra.py \
+            --registro .dotech-src/scripts/dotech/arreglos.toml \
+            --fuente .dotech-src --original . --salida "$RUNNER_TEMP/resultados/sobra.json"
+
+      - name: Subir resultados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ inputs.lado }}
+          path: ${{ runner.temp }}/resultados/
+          if-no-files-found: error
+          overwrite: true

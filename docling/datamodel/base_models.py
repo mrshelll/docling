@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -96,9 +99,11 @@ class InputFormat(str, Enum):
 
     DOCX = "docx"
     DOC = "doc"
+    RTF = "rtf"
     PPTX = "pptx"
     PPT = "ppt"
     HTML = "html"
+    MHTML = "mhtml"
     IMAGE = "image"
     PDF = "pdf"
     ASCIIDOC = "asciidoc"
@@ -123,6 +128,11 @@ class InputFormat(str, Enum):
     EMAIL = "email"
     EPUB = "epub"
     BOXNOTE = "boxnote"
+    IWORK_PAGES = "iwork_pages"
+    IWORK_KEYNOTE = "iwork_keynote"
+    IWORK_NUMBERS = "iwork_numbers"
+    EBCDIC = "ebcdic"
+    AFP = "afp"
 
 
 class OutputFormat(str, Enum):
@@ -137,24 +147,27 @@ class OutputFormat(str, Enum):
     DOCLANG = "doclang"
     DCLX = "dclx"
     CHUNKS = "chunks"
+    LATEX = "latex"
 
 
 FormatToExtensions: dict[InputFormat, list[str]] = {
     InputFormat.DOCX: ["docx", "dotx", "docm", "dotm"],
     InputFormat.DOC: ["doc", "dot"],
+    InputFormat.RTF: ["rtf"],
     InputFormat.PPTX: ["pptx", "potx", "ppsx", "pptm", "potm", "ppsm"],
     InputFormat.PPT: ["ppt", "pot", "pps"],
     InputFormat.PDF: ["pdf"],
-    InputFormat.MD: ["md", "txt", "text", "qmd", "rmd", "Rmd"],
+    InputFormat.MD: ["md", "markdown", "txt", "text", "qmd", "rmd", "Rmd"],
     InputFormat.HTML: ["html", "htm", "xhtml"],
+    InputFormat.MHTML: ["mhtml", "mht"],
     InputFormat.XML_JATS: ["xml", "nxml"],
     InputFormat.XML_XBRL: ["xml", "xbrl"],
     InputFormat.XML_DOCLANG: ["dclg", "dclg.xml"],
     InputFormat.DCLX: ["dclx"],
-    InputFormat.IMAGE: ["jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp"],
+    InputFormat.IMAGE: ["jpg", "jpeg", "png", "tif", "tiff", "bmp", "webp", "gif"],
     InputFormat.ASCIIDOC: ["adoc", "asciidoc", "asc"],
     InputFormat.CSV: ["csv"],
-    InputFormat.XLSX: ["xlsx", "xlsm"],
+    InputFormat.XLSX: ["xlsx", "xlsm", "xltx", "xltm"],
     InputFormat.XLS: ["xls", "xlt"],
     InputFormat.ODT: ["odt", "ott"],
     InputFormat.ODS: ["ods", "ots"],
@@ -166,9 +179,14 @@ FormatToExtensions: dict[InputFormat, list[str]] = {
     InputFormat.VIDEO: ["mp4", "avi", "mov", "mkv", "webm"],
     InputFormat.VTT: ["vtt"],
     InputFormat.LATEX: ["tex", "latex"],
-    InputFormat.EMAIL: ["eml"],
+    InputFormat.EMAIL: ["eml", "msg"],
     InputFormat.EPUB: ["epub"],
     InputFormat.BOXNOTE: ["boxnote"],
+    InputFormat.IWORK_PAGES: ["pages"],
+    InputFormat.IWORK_KEYNOTE: ["key"],
+    InputFormat.IWORK_NUMBERS: ["numbers"],
+    InputFormat.EBCDIC: ["ebc", "ebcdic"],
+    InputFormat.AFP: ["afp"],
 }
 
 FormatToMimeType: dict[InputFormat, list[str]] = {
@@ -180,6 +198,11 @@ FormatToMimeType: dict[InputFormat, list[str]] = {
         "application/msword",
         "application/x-msword",
     ],
+    InputFormat.RTF: [
+        "application/rtf",
+        "text/rtf",
+        "application/x-rtf",
+    ],
     InputFormat.PPTX: [
         "application/vnd.openxmlformats-officedocument.presentationml.template",
         "application/vnd.openxmlformats-officedocument.presentationml.slideshow",
@@ -189,6 +212,7 @@ FormatToMimeType: dict[InputFormat, list[str]] = {
         "application/vnd.ms-powerpoint",
     ],
     InputFormat.HTML: ["text/html", "application/xhtml+xml"],
+    InputFormat.MHTML: ["application/x-mimearchive", "multipart/related"],
     InputFormat.XML_JATS: ["application/xml"],
     InputFormat.XML_XBRL: ["application/xml", "application/xhtml+xml"],
     InputFormat.XML_DOCLANG: ["application/xml"],
@@ -248,9 +272,23 @@ FormatToMimeType: dict[InputFormat, list[str]] = {
     ],
     InputFormat.VTT: ["text/vtt"],
     InputFormat.LATEX: ["text/x-tex", "application/x-tex", "text/x-latex"],
-    InputFormat.EMAIL: ["message/rfc822"],
+    InputFormat.EMAIL: ["message/rfc822", "application/vnd.ms-outlook"],
     InputFormat.EPUB: ["application/epub+zip"],
     InputFormat.BOXNOTE: ["application/vnd.box.boxnote"],
+    InputFormat.IWORK_PAGES: [
+        "application/vnd.apple.pages",
+        "application/x-iwork-pages-sffpages",
+    ],
+    InputFormat.IWORK_KEYNOTE: [
+        "application/vnd.apple.keynote",
+        "application/x-iwork-keynote-sffkey",
+    ],
+    InputFormat.IWORK_NUMBERS: [
+        "application/vnd.apple.numbers",
+        "application/x-iwork-numbers-sffnumbers",
+    ],
+    InputFormat.EBCDIC: ["application/x-ebcdic"],
+    InputFormat.AFP: ["application/vnd.ibm.modcap", "application/x-afp"],
 }
 
 MimeTypeToFormat: dict[str, list[InputFormat]] = {
@@ -278,6 +316,7 @@ class VlmStopReason(str, Enum):
     STOP_SEQUENCE = "stop_sequence"  # Custom stopping criteria met
     END_OF_SEQUENCE = "end_of_sequence"  # Model generated end-of-text token
     CONTENT_FILTERED = "content_filter"  # Content filtered by API provider
+    INFERENCE_ERROR = "inference_error"  # Inference call failed (remote API or local engine), no output
     UNSPECIFIED = "unspecified"  # Defaul none value
 
 
@@ -363,6 +402,7 @@ class VlmPrediction(BaseModel):
     usage: Any | None = None
     stop_reason: VlmStopReason = VlmStopReason.UNSPECIFIED
     input_prompt: str | None = None
+    error_message: str | None = None  # set when stop_reason is INFERENCE_ERROR
 
 
 @dataclass(frozen=True)
@@ -373,6 +413,8 @@ class ApiImageRequestResult:
     num_tokens: int | None
     stop_reason: VlmStopReason
     usage: Any | None = None
+    logprobs: Any | None = None
+    error: str | None = None  # set when stop_reason is INFERENCE_ERROR
 
 
 @dataclass(frozen=True)
@@ -382,6 +424,7 @@ class ApiImageStreamingRequestResult:
     text: str
     num_tokens: int | None
     usage: Any | None = None
+    logprobs: Any | None = None
 
 
 class ContainerElement(
@@ -471,6 +514,11 @@ class Page(BaseModel):
     _backend: Optional["PdfPageBackend"] = (
         None  # Internal PDF backend. By default it is cleared during assembling.
     )
+    # Visible vector geometry captured while the page backend is alive. These
+    # are transient pipeline signals and deliberately stay out of serialized
+    # conversion results.
+    _shape_lines: list[BoundingBox] | None = PrivateAttr(default=None)
+    _shape_bounding_boxes: list[BoundingBox] | None = PrivateAttr(default=None)
     _default_image_scale: float = 1.0  # Default image scale for external usage.
     _image_cache: dict[
         float, Image
@@ -525,13 +573,35 @@ class Page(BaseModel):
 class OpenAiChatMessage(BaseModel):
     role: str
     content: str | None = None
+    # Some reasoning-style servers (e.g. LM Studio serving chandra-ocr-2) leave
+    # content empty and place the actual answer in reasoning_content.
+    reasoning_content: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
+
+
+class OpenAiTopLogprob(BaseModel):
+    token: str
+    bytes: list[int] | None = None
+    logprob: float
+
+
+class OpenAiTokenLogprob(BaseModel):
+    token: str
+    bytes: list[int] | None = None
+    logprob: float
+    top_logprobs: list[OpenAiTopLogprob] | None = None
+
+
+class OpenAiResponseLogprobs(BaseModel):
+    content: list[OpenAiTokenLogprob] | None = None
+    refusal: list[OpenAiTokenLogprob] | None = None
 
 
 class OpenAiResponseChoice(BaseModel):
     index: int
     message: OpenAiChatMessage
     finish_reason: str | None
+    logprobs: OpenAiResponseLogprobs | None = None
 
 
 class OpenAiResponseUsage(BaseModel):

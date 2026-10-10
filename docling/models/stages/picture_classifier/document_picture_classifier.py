@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: The Docling Contributors
+# SPDX-License-Identifier: MIT
+
 from collections.abc import Iterable
 from pathlib import Path
 from typing import List, Optional, Union
@@ -118,7 +121,11 @@ class DocumentPictureClassifier(
         bool
             True if the element is a PictureItem and processing is enabled; False otherwise.
         """
-        return self.enabled and isinstance(element, PictureItem)
+        return (
+            self.enabled
+            and isinstance(element, PictureItem)
+            and (element.meta is None or element.meta.classification is None)
+        )
 
     def __call__(
         self,
