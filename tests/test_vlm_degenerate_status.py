@@ -113,3 +113,27 @@ def test_failed_inference_counts_as_one_failed_page(pipeline: VlmPipeline) -> No
     alone = _conv_res([_page(1, "", VlmStopReason.INFERENCE_ERROR)])
     assert pipeline._determine_status(alone) == ConversionStatus.FAILURE
     assert [e.page_no for e in alone.errors] == [1]
+
+
+def test_all_pages_looping_cut_at_max_tokens_is_failure(pipeline: VlmPipeline) -> None:
+    """A loop usually runs until the token limit, so it arrives as LENGTH: it is still
+    a page with no usable output, reported once."""
+    conv_res = _conv_res(
+        [_page(1, LOOP, VlmStopReason.LENGTH), _page(2, LOOP, VlmStopReason.LENGTH)]
+    )
+    assert pipeline._determine_status(conv_res) == ConversionStatus.FAILURE
+    assert [e.page_no for e in conv_res.errors] == [1, 2]
+
+
+def test_healthy_page_cut_at_max_tokens_is_partial(pipeline: VlmPipeline) -> None:
+    conv_res = _conv_res([_page(1, HEALTHY, VlmStopReason.LENGTH)])
+    assert pipeline._determine_status(conv_res) == ConversionStatus.PARTIAL_SUCCESS
+    assert [e.page_no for e in conv_res.errors] == [1]
+
+
+def test_some_pages_looping_cut_at_max_tokens_is_partial(
+    pipeline: VlmPipeline,
+) -> None:
+    conv_res = _conv_res([_page(1, HEALTHY), _page(2, LOOP, VlmStopReason.LENGTH)])
+    assert pipeline._determine_status(conv_res) == ConversionStatus.PARTIAL_SUCCESS
+    assert [e.page_no for e in conv_res.errors] == [2]
