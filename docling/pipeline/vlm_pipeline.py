@@ -474,6 +474,8 @@ class VlmPipeline(PaginatedPipeline):
                     )
                 )
                 status = ConversionStatus.PARTIAL_SUCCESS
+                # The page produced no usable output, same as a failed call.
+                failed_pages += 1
 
         if conv_res.pages and failed_pages == len(conv_res.pages):
             # No page produced any output: that is a failed conversion, not a

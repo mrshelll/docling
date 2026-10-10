@@ -75,6 +75,41 @@ def test_healthy_answer_stays_success(pipeline: VlmPipeline) -> None:
 def test_failed_inference_is_reported_once(pipeline: VlmPipeline) -> None:
     """Upstream (#4332) already flags a failed inference call; an empty answer from
     that same page must not add a second error."""
-    conv_res = _conv_res([_page(1, HEALTHY), _page(2, "", VlmStopReason.INFERENCE_ERROR)])
+    conv_res = _conv_res(
+        [_page(1, HEALTHY), _page(2, "", VlmStopReason.INFERENCE_ERROR)]
+    )
     pipeline._determine_status(conv_res)
     assert [e.page_no for e in conv_res.errors] == [2]
+
+
+def test_all_pages_empty_is_failure(pipeline: VlmPipeline) -> None:
+    """A document where no page produced usable output is a failed conversion, so
+    `raises_on_error` fires for it."""
+    conv_res = _conv_res([_page(1, ""), _page(2, "   \n")])
+    assert pipeline._determine_status(conv_res) == ConversionStatus.FAILURE
+    assert [e.page_no for e in conv_res.errors] == [1, 2]
+
+
+def test_all_pages_looping_is_failure(pipeline: VlmPipeline) -> None:
+    conv_res = _conv_res([_page(1, LOOP), _page(2, LOOP)])
+    assert pipeline._determine_status(conv_res) == ConversionStatus.FAILURE
+    assert [e.page_no for e in conv_res.errors] == [1, 2]
+
+
+def test_some_pages_degenerate_is_partial(pipeline: VlmPipeline) -> None:
+    conv_res = _conv_res([_page(1, HEALTHY), _page(2, ""), _page(3, LOOP)])
+    assert pipeline._determine_status(conv_res) == ConversionStatus.PARTIAL_SUCCESS
+    assert [e.page_no for e in conv_res.errors] == [2, 3]
+
+
+def test_failed_inference_counts_as_one_failed_page(pipeline: VlmPipeline) -> None:
+    """A failed call with an empty answer is one failed page, not two: with one
+    healthy page beside it the document is partial, not failed; on its own it is
+    failed with a single error."""
+    mixed = _conv_res([_page(1, "", VlmStopReason.INFERENCE_ERROR), _page(2, HEALTHY)])
+    assert pipeline._determine_status(mixed) == ConversionStatus.PARTIAL_SUCCESS
+    assert [e.page_no for e in mixed.errors] == [1]
+
+    alone = _conv_res([_page(1, "", VlmStopReason.INFERENCE_ERROR)])
+    assert pipeline._determine_status(alone) == ConversionStatus.FAILURE
+    assert [e.page_no for e in alone.errors] == [1]
