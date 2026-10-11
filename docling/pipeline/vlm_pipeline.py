@@ -460,6 +460,14 @@ class VlmPipeline(PaginatedPipeline):
                     )
                 )
                 status = ConversionStatus.PARTIAL_SUCCESS
+                if (
+                    vlm_response.stop_reason == VlmStopReason.LENGTH
+                    and looks_degenerate(vlm_response.text)
+                ):
+                    # A repetition loop usually runs until the token limit: the
+                    # truncation error above already reports it, but the page has
+                    # no usable output and counts as failed.
+                    failed_pages += 1
             elif looks_degenerate(vlm_response.text):
                 # Generation can finish normally and still hand back nothing, or the
                 # same line hundreds of times. Neither is reported as an error, so
@@ -474,6 +482,8 @@ class VlmPipeline(PaginatedPipeline):
                     )
                 )
                 status = ConversionStatus.PARTIAL_SUCCESS
+                # The page produced no usable output, same as a failed call.
+                failed_pages += 1
 
         if conv_res.pages and failed_pages == len(conv_res.pages):
             # No page produced any output: that is a failed conversion, not a
