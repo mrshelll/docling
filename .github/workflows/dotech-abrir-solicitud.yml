@@ -50,7 +50,7 @@ jobs:
             --json number,isCrossRepository --jq '[.[] | select(.isCrossRepository | not)][0].number // empty')
           if [ -z "$numero" ]; then
             url=$(gh pr create -R "$GITHUB_REPOSITORY" --base main --head "$RAMA" --title "$TITULO" \
-              --body "Abierta por la cuenta de servicio para que la aprueben Miguel y Fabio. La validación con documentos reales la hace sola el servidor DOTECH (estado dotech/validacion-local)." \
+              --body "Abierta por la cuenta de servicio para que la aprueben Miguel y Fabio. La validación con documentos reales la hace sola el servidor DOTECH (estado dotech/validacion-local) en menos de una hora." \
               --reviewer mrshelll,alejojau)
             numero="${url##*/}"
           else
@@ -167,27 +167,7 @@ jobs:
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
             -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
-            -f context=dotech/validacion-local -f description="En cola: validación con documentos reales en el servidor DOTECH"
-      # El aviso solo adelanta la validación: si no llega (app sin instalar en el repo
-      # privado, red), el barrido horario del servidor la encuentra por su estado
-      # pendiente, por eso no tumba el job. El token es aparte porque el de la app de
-      # este job solo sirve para este repo.
-      - id: app-aviso
-        continue-on-error: true
-        uses: actions/create-github-app-token@v2
-        with:
-          app-id: ${{ secrets.DOTECH_APP_ID }}
-          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
-          owner: mrshelll
-          repositories: docling-validacion
-      - name: Avisar al servidor de validación
-        if: steps.app-aviso.outcome == 'success'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ steps.app-aviso.outputs.token }}
-          NUMERO: ${{ needs.abrir.outputs.numero }}
-        run: |
-          gh api -X POST repos/mrshelll/docling-validacion/dispatches -f event_type=validar-solicitud -F "client_payload[pr]=$NUMERO"
+            -f context=dotech/validacion-local -f description="En cola: el servidor DOTECH la valida con documentos reales en menos de una hora"
       - name: Marcar el fallo en el commit
         if: failure()
         env:
