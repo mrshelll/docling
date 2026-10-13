@@ -522,7 +522,8 @@ jobs:
           cat "$d/cuerpo.md" >> "$GITHUB_STEP_SUMMARY"
       # El resumen del conflicto va también como comentario: el cuerpo lo reescribe
       # la siguiente versión. La primera línea del comentario evita repetirlo.
-      - name: Abrir o actualizar la solicitud
+      - id: abrir
+        name: Abrir o actualizar la solicitud
         if: env.SIMULAR != 'true'
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
@@ -546,6 +547,7 @@ jobs:
               gh pr comment "$numero" -R "$GITHUB_REPOSITORY" --body-file "$comentario"
             fi
           fi
+          echo "numero=$numero" >> "$GITHUB_OUTPUT"
       - name: Estados del commit
         if: env.SIMULAR != 'true'
         env:
@@ -556,7 +558,28 @@ jobs:
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
             -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
-            -f context=dotech/validacion-local -f description="Falta docling-validar en el Mac de Miguel"
+            -f context=dotech/validacion-local -f description="En cola: validación con documentos reales en el servidor DOTECH"
+      # El aviso solo adelanta la validación: si no llega (app sin instalar en el repo
+      # privado, red), el barrido horario del servidor la encuentra por su estado
+      # pendiente, por eso no tumba el job. El token es aparte porque el de la app de
+      # este job solo sirve para este repo.
+      - id: app-aviso
+        if: env.SIMULAR != 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.DOTECH_APP_ID }}
+          private-key: ${{ secrets.DOTECH_APP_PRIVATE_KEY }}
+          owner: mrshelll
+          repositories: docling-validacion
+      - name: Avisar al servidor de validación
+        if: env.SIMULAR != 'true' && steps.app-aviso.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-aviso.outputs.token }}
+          NUMERO: ${{ steps.abrir.outputs.numero }}
+        run: |
+          gh api -X POST repos/mrshelll/docling-validacion/dispatches -f event_type=validar-solicitud -F "client_payload[pr]=$NUMERO"
       # La solicitud lleva la marca de revisión a mano (el mismo formato que
       # informe.titulo): si ya existía, su título pasa a la versión nueva; si la rama
       # se publicó sin solicitud, se abre ya marcada. Así la siguiente ejecución ve
