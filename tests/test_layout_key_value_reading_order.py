@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: DoTech Labs S.A.S
+# SPDX-License-Identifier: MIT
+
 """Los hijos de una región clave-valor deben quedar en orden de lectura fila-mayor.
 
 Muchos formularios se generan escribiendo el content stream **columna por

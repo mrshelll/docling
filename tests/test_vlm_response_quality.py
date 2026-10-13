@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: DoTech Labs S.A.S
+# SPDX-License-Identifier: MIT
+
 """A VLM can answer with nothing at all, or with the same line 238 times. Both were
 reported as ConversionStatus.SUCCESS with zero errors, so a batch conversion would hand
 over blank or garbage documents without raising anything.

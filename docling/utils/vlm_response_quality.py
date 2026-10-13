@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: DoTech Labs S.A.S
+# SPDX-License-Identifier: MIT
+
 """Detect VLM answers that cannot be a page's content.
 
 A vision model can answer with nothing at all, or fall into a repetition loop and emit
