@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: DoTech Labs S.A.S
+# SPDX-License-Identifier: MIT
+
 """Bugs 4 and 5: an empty VLM answer, or one stuck in a repetition loop, must not be
 reported as a successful conversion.
 

@@ -556,7 +556,7 @@ jobs:
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state="$ESTADO" \
             -f context=dotech/tests -f description="$DESCRIPCION" -f target_url="$ENLACE"
           gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f state=pending \
-            -f context=dotech/validacion-local -f description="Falta docling-validar en el Mac de Miguel"
+            -f context=dotech/validacion-local -f description="En cola: el servidor DOTECH la valida con documentos reales en menos de una hora"
       # La solicitud lleva la marca de revisión a mano (el mismo formato que
       # informe.titulo): si ya existía, su título pasa a la versión nueva; si la rama
       # se publicó sin solicitud, se abre ya marcada. Así la siguiente ejecución ve

@@ -208,7 +208,7 @@ def cuerpo(
     l += _seccion_conflicto(conflicto, resumen_conflicto)
 
     l += ["## Antes de aprobar", "",
-          "- [ ] Validación local: `docling-validar <número de esta solicitud>` en el Mac de Miguel",
+          "- [ ] Validación con documentos reales: la hace sola el servidor DOTECH (estado `dotech/validacion-local`); a mano: `docling-validar <número>` en el Mac de Miguel",
           "- [ ] Aprobación de Miguel", "- [ ] Aprobación de Fabio", "",
           "Integrar solo con **Create a merge commit**."]
     return "\n".join(l) + "\n"
