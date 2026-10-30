@@ -7,7 +7,7 @@
 #   (github.sha), git sin hooks o gh. Nunca código del árbol mezclado.
 # - Los jobs que ejecutan el árbol mezclado o en los que corre Claude (preparar,
 #   tests-*, explicar) no ven esa llave: solo el token de lectura del flujo y,
-#   donde corre Claude, su token OAuth.
+#   donde corre Claude, su API key (facturación aparte de la suscripción).
 # - preparar no publica: entrega la rama como git bundle y publicar-rama la
 #   empuja desde un runner limpio.
 # - Los tres secretos viven en el entorno `dotech`, que solo admite ejecuciones
@@ -94,7 +94,7 @@ jobs:
         run: python3 scripts/dotech/version.py --repo "$GITHUB_REPOSITORY" --upstream "$UPSTREAM" --rama "$RAMA" --ref "$REF_MANUAL" >> "$GITHUB_OUTPUT"
 
   # Código: árbol mezclado (setup-ubuntu-ci, tests) y Claude con Edit.
-  # Secretos: CLAUDE_CODE_OAUTH_TOKEN; GITHUB_TOKEN de solo lectura. Sin llave de la App.
+  # Secretos: ANTHROPIC_API_KEY; GITHUB_TOKEN de solo lectura. Sin llave de la App.
   preparar:
     needs: decidir
     if: needs.decidir.outputs.accion == 'sincronizar'
@@ -163,7 +163,7 @@ jobs:
         timeout-minutes: 45
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           prompt: |
             Estás en un `git merge` en curso: la versión ${{ needs.decidir.outputs.tag }} del
@@ -377,7 +377,7 @@ jobs:
           overwrite: true
 
   # Código: Claude en solo lectura sobre el árbol mezclado.
-  # Secretos: CLAUDE_CODE_OAUTH_TOKEN; GITHUB_TOKEN de lectura. Sin llave de la App.
+  # Secretos: ANTHROPIC_API_KEY; GITHUB_TOKEN de lectura. Sin llave de la App.
   explicar:
     needs: [decidir, publicar-rama, comparar]
     if: always() && needs.comparar.outputs.hay_nuestras == 'true'
@@ -401,7 +401,7 @@ jobs:
         continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           prompt: |
             Tras mezclar la versión ${{ needs.decidir.outputs.tag }} del original en nuestro fork,
