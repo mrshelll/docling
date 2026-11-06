@@ -1145,6 +1145,16 @@ detailed descriptions of image content.
 """
 
 
+class NemotronParseOptions(BaseModel):
+    """Nemotron 3.5 Parse stages. Single-pass preserves the preset defaults."""
+
+    passes: Literal["single", "double", "triple"] = "single"
+    triple_regions: Literal["detector", "union"] = "union"
+    crop_batch_size: int = Field(
+        default=8, ge=1, description="Maximum crops per engine batch"
+    )
+
+
 class VlmConvertOptions(StagePresetMixin, VlmEngineOptionsMixin, BaseModel):
     """Configuration for VLM-based document conversion.
 
@@ -1178,6 +1188,11 @@ class VlmConvertOptions(StagePresetMixin, VlmEngineOptionsMixin, BaseModel):
 
     batch_size: int = Field(
         default=1, description="Batch size for processing multiple pages"
+    )
+
+    nemotron_parse: NemotronParseOptions = Field(
+        default_factory=NemotronParseOptions,
+        description="Multi-pass options for the nemotron_parse_v3_5 response format",
     )
 
     force_backend_text: bool = Field(
@@ -1263,9 +1278,14 @@ VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_GEMMA_27B)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_DOLPHIN)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_GLMOCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_LIGHTONOCR)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_LIGHTONOCR_3_08B)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_LIGHTONOCR_3_4B)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_FALCON_OCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_CHANDRA_OCR2)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_SURYA_OCR2_5)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_UNLIMITED_OCR)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_UNLIMITED_OCR2)
+VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_UNLIMITED_OCR2_MLX)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_DOTS_OCR)
 VlmConvertOptions.register_preset(stage_model_specs.VLM_CONVERT_DOTS_MOCR)
 
@@ -2113,6 +2133,33 @@ class HeadingHierarchyOptions(BaseModel):
     ] = 0.8
 
 
+class ScriptPositionOptions(BaseModel):
+    """Options for recovering superscript and subscript text in the PDF pipeline.
+
+    When ``enabled``, characters drawn smaller than their line and raised or lowered against
+    it (footnote markers, "1st", "mc2", "H2O") are marked with ``formatting.script``. A text
+    item holding them keeps its place, and its text moves into an inline group of runs.
+
+    Notes:
+        - Character positions are read with pypdfium2 whichever backend parsed the page; the
+          step is skipped with a warning when pypdfium2 is not installed.
+        - Body text, list items and footnotes are handled; headings, captions, tables, code,
+          formulas, OCR text and invisible text (such as an OCR layer over a scan) are left
+          unchanged.
+    """
+
+    enabled: Annotated[
+        bool,
+        Field(
+            description=(
+                "Enable recovery of superscript and subscript text for the PDF pipeline. "
+                "When disabled (default), raised and lowered text stays part of its plain "
+                "text item (unchanged behavior)."
+            )
+        ),
+    ] = False
+
+
 class PdfPipelineOptions(PaginatedPipelineOptions):
     """Configuration options for the PDF document processing pipeline.
 
@@ -2298,6 +2345,17 @@ class PdfPipelineOptions(PaginatedPipelineOptions):
             )
         ),
     ] = HeadingHierarchyOptions()
+    script_position_options: Annotated[
+        ScriptPositionOptions,
+        Field(
+            description=(
+                "Configuration for recovering superscript and subscript text, such as "
+                "footnote markers, ordinals and chemical formulas. Disabled by default; when "
+                "enabled, text items holding raised or lowered characters become inline "
+                "groups whose runs carry formatting.script."
+            )
+        ),
+    ] = ScriptPositionOptions()
 
     ### Arguments for threaded PDF pipeline with batching and backpressure control
 
