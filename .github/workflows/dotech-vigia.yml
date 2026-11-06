@@ -7,7 +7,8 @@
 #   (github.sha), git sin hooks o gh. Nunca código del árbol mezclado.
 # - Los jobs que ejecutan el árbol mezclado o en los que corre Claude (preparar,
 #   tests-*, explicar) no ven esa llave: solo el token de lectura del flujo y,
-#   donde corre Claude, su API key (facturación aparte de la suscripción).
+#   donde corre Claude, su API key (facturación aparte de la suscripción). La key
+#   va solo en el paso que llama a Claude, no en el job.
 # - preparar no publica: entrega la rama como git bundle y publicar-rama la
 #   empuja desde un runner limpio.
 # - Los tres secretos viven en el entorno `dotech`, que solo admite ejecuciones
@@ -39,6 +40,8 @@ concurrency:
 
 env:
   UPSTREAM: docling-project/docling
+  # Claude Code que corre en preparar y explicar (`claude -p`, como el radar semanal).
+  VERSION_CLAUDE: "2.1.319"
   RAMA: dotech/sync-upstream
   # En `schedule` el contexto `inputs` está vacío: simular queda en false.
   SIMULAR: ${{ inputs.simular == true }}
@@ -111,8 +114,8 @@ jobs:
       NOMBRE: ${{ needs.decidir.outputs.autor_nombre }}
       CORREO: ${{ needs.decidir.outputs.autor_correo }}
       BASE: ${{ needs.decidir.outputs.base }}
-      # claude-code-action lo lee del entorno del job: limpia de secretos el entorno
-      # de los procesos que lanza Claude (los tests del árbol mezclado).
+      # Claude Code lo lee del entorno: limpia de secretos el entorno de los procesos
+      # que lanza Claude (los tests del árbol mezclado) y los aísla con bubblewrap.
       CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
     steps:
       - uses: actions/checkout@v6
@@ -153,50 +156,90 @@ jobs:
           uv_sync_args: --frozen --group dev --all-extras --all-packages --no-group docs --no-group examples
           install_system_deps: "true"
           cache_models: "true"
+      - if: steps.merge.outputs.conflicto == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Claude se llama directo con `claude -p`, como el radar semanal, y no con
+      # claude-code-action: la acción marca sus llamadas como producto «Claude Code»,
+      # que el crédito promocional de la cuenta no cubre («Credit balance is too low»,
+      # 2026-11-06); `claude -p` cuenta como Agent SDK. bubblewrap y socat: con
+      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, Claude Code aísla sus comandos de terminal y
+      # sin ellos los rechaza todos. Si algo de esto falla, el paso de Claude falla y
+      # el informe da el motivo.
+      - name: Instalar Claude Code
+        if: steps.merge.outputs.conflicto == 'true'
+        continue-on-error: true
+        run: |
+          npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@$VERSION_CLAUDE"
+          claude --version
+          if ! { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends bubblewrap socat; }; then
+            echo "::warning::No se pudieron instalar bubblewrap y socat: Claude no podrá correr comandos de terminal."
+          fi
+          # Ubuntu 24.04 restringe los espacios de nombres sin privilegios que usa bubblewrap.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
       # Un solo intento. continue-on-error: si Claude falla, agota los 45 minutos o no
       # devuelve el resumen, el informe sale en rojo con el motivo del fallo (paso
       # siguiente) y la rama se publica igual: no se repite el intento.
       # --setting-sources user: los ajustes de .claude/ del árbol mezclado no cuentan.
+      # La versión y los archivos llegan por el entorno, nunca interpolados en el script.
       - id: claude
         name: Claude resuelve el conflicto
         if: steps.merge.outputs.conflicto == 'true'
         continue-on-error: true
         timeout-minutes: 45
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ github.token }}
-          prompt: |
-            Estás en un `git merge` en curso: la versión ${{ needs.decidir.outputs.tag }} del
-            proyecto original de Docling se está mezclando sobre nuestro fork. Hay conflictos en:
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TAG: ${{ needs.decidir.outputs.tag }}
+          ARCHIVOS: ${{ steps.merge.outputs.archivos }}
+        run: |
+          salida="$RUNNER_TEMP/claude-conflicto.json"
+          echo "execution_file=$salida" >> "$GITHUB_OUTPUT"
+          plantilla=$(cat <<'PROMPT'
+          Estás en un `git merge` en curso: la versión __TAG__ del
+          proyecto original de Docling se está mezclando sobre nuestro fork. Hay conflictos en:
 
-            ${{ steps.merge.outputs.archivos }}
+          __ARCHIVOS__
 
-            Nuestros arreglos propios están descritos en `scripts/dotech/arreglos.toml`
-            (qué archivos tocan y qué test comprueba cada uno).
+          Nuestros arreglos propios están descritos en `scripts/dotech/arreglos.toml`
+          (qué archivos tocan y qué test comprueba cada uno).
 
-            Para cada archivo en conflicto:
-            1. Entiende qué cambió el original (`git log -p ORIG_HEAD..MERGE_HEAD -- <archivo>`)
-               y qué hacía nuestro lado (`git log -p MERGE_HEAD..ORIG_HEAD -- <archivo>`).
-            2. Conserva el comportamiento de nuestro arreglo adaptado a la estructura nueva del
-               original. No reviertas cambios del original. Si nuestro bloque pertenece a código
-               que el original eliminó o movió, lleva nuestro cambio al sitio nuevo.
-            3. Deja el archivo sin marcas de conflicto.
+          Para cada archivo en conflicto:
+          1. Entiende qué cambió el original (`git log -p ORIG_HEAD..MERGE_HEAD -- <archivo>`)
+             y qué hacía nuestro lado (`git log -p MERGE_HEAD..ORIG_HEAD -- <archivo>`).
+          2. Conserva el comportamiento de nuestro arreglo adaptado a la estructura nueva del
+             original. No reviertas cambios del original. Si nuestro bloque pertenece a código
+             que el original eliminó o movió, lleva nuestro cambio al sitio nuevo.
+          3. Deja el archivo sin marcas de conflicto.
 
-            Después corre los tests de comportamiento de los arreglos afectados con
-            `uv run --no-sync pytest -q -p no:cacheprovider <test>`.
+          Después corre los tests de comportamiento de los arreglos afectados con
+          `uv run --no-sync pytest -q -p no:cacheprovider <test>`.
 
-            No hagas commit ni push: el flujo se encarga. Responde con el resumen estructurado:
-            `resuelto` = true solo si no quedan marcas y los tests de los arreglos afectados pasan.
-          claude_args: >-
-            --model claude-sonnet-5-5
-            --max-turns 40
-            --setting-sources user
-            --allowedTools "Read,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(uv run --no-sync pytest:*)"
-            --json-schema '{"type":"object","properties":{"resuelto":{"type":"boolean"},"archivos":{"type":"array","items":{"type":"object","properties":{"archivo":{"type":"string"},"original":{"type":"string"},"decision":{"type":"string"},"tests":{"type":"string"}},"required":["archivo","original","decision","tests"]}}},"required":["resuelto","archivos"]}'
-      # La acción oculta la salida de Claude en el registro, también en modo depuración:
-      # si falla (p. ej. la API rechaza la clave), el motivo se saca del archivo de
-      # ejecución para el informe. El script sale del commit de este workflow, no del
+          No hagas commit ni push: el flujo se encarga. Responde con el resumen estructurado:
+          `resuelto` = true solo si no quedan marcas y los tests de los arreglos afectados pasan.
+          PROMPT
+          )
+          # Sin esto, bash 5.2 trataría un «&» de los nombres de archivo como el texto buscado.
+          shopt -u patsub_replacement 2>/dev/null || true
+          prompt=${plantilla//__TAG__/$TAG}
+          prompt=${prompt//__ARCHIVOS__/$ARCHIVOS}
+          esquema='{"type":"object","properties":{"resuelto":{"type":"boolean"},"archivos":{"type":"array","items":{"type":"object","properties":{"archivo":{"type":"string"},"original":{"type":"string"},"decision":{"type":"string"},"tests":{"type":"string"}},"required":["archivo","original","decision","tests"]}}},"required":["resuelto","archivos"]}'
+          claude -p "$prompt" \
+            --model claude-sonnet-5-5 \
+            --max-turns 40 \
+            --max-budget-usd 10 \
+            --setting-sources user \
+            --output-format json \
+            --allowedTools "Read,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(uv run --no-sync pytest:*)" \
+            --json-schema "$esquema" \
+            </dev/null > "$salida"
+          jq -e '.is_error == false and (.structured_output | type == "object")' "$salida" > /dev/null
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "structured_output<<$delim"; jq -c '.structured_output' "$salida"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+      # Si Claude falla (p. ej. la API rechaza la llamada), el motivo se saca de su
+      # resultado JSON para el informe. El script sale del commit de este workflow, no del
       # árbol en el que trabajó Claude, y no escribe en ese árbol. Si este paso falla,
       # el informe sale sin motivo, no sin informe.
       - id: fallo_claude
@@ -208,15 +251,15 @@ jobs:
         run: |
           git cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null || git fetch --quiet --no-tags origin "$GITHUB_SHA"
           git show "$GITHUB_SHA:scripts/dotech/error_claude.py" > "$RUNNER_TEMP/error_claude.py"
-          motivo=$(python3 -I "$RUNNER_TEMP/error_claude.py" "${SALIDA:-$RUNNER_TEMP/claude-execution-output.json}")
+          motivo=$(python3 -I "$RUNNER_TEMP/error_claude.py" "${SALIDA:-$RUNNER_TEMP/claude-conflicto.json}")
           echo "::error::Claude falló: $motivo"
           echo "motivo=$motivo" >> "$GITHUB_OUTPUT"
       # Si quedan marcas se commitea igual y el resumen se vacía (= no resuelto): la
       # solicitud sale en rojo y para revisar a mano, y la siguiente ejecución ve la
       # versión ya en la rama y no vuelve a llamar a Claude. Lo que Claude cambió fuera
       # de los archivos en conflicto no se revierte: se lista en el informe (de_mas),
-      # que lo marca para revisar a mano. La acción de Claude cambia
-      # user.name/user.email a claude[bot]: se restaura la cuenta de servicio.
+      # que lo marca para revisar a mano. La identidad git se fija de nuevo por si Claude
+      # la cambió: el commit es siempre de la cuenta de servicio.
       - id: cerrar
         name: Cerrar el merge
         if: steps.merge.outputs.conflicto == 'true'
@@ -414,34 +457,68 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: informe-datos
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Claude se llama directo con `claude -p`, como el radar semanal, y no con
+      # claude-code-action: la acción marca sus llamadas como producto «Claude Code»,
+      # que el crédito promocional de la cuenta no cubre («Credit balance is too low»,
+      # 2026-11-06); `claude -p` cuenta como Agent SDK. bubblewrap y socat: con
+      # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, Claude Code aísla sus comandos de terminal y
+      # sin ellos los rechaza todos. Si algo de esto falla, el paso de Claude falla y
+      # el informe da el motivo.
+      - name: Instalar Claude Code
+        continue-on-error: true
+        run: |
+          npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@$VERSION_CLAUDE"
+          claude --version
+          if ! { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends bubblewrap socat; }; then
+            echo "::warning::No se pudieron instalar bubblewrap y socat: Claude no podrá correr comandos de terminal."
+          fi
+          # Ubuntu 24.04 restringe los espacios de nombres sin privilegios que usa bubblewrap.
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
       # Si Claude falla, la solicitud sale sin explicación, no sin informe. El límite va
       # en el paso y no solo en el job: así, si se agota, fallo_claude aún corre.
       - id: claude
         name: Claude explica los fallos nuestros
         continue-on-error: true
         timeout-minutes: 15
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          github_token: ${{ github.token }}
-          prompt: |
-            Tras mezclar la versión ${{ needs.decidir.outputs.tag }} del original en nuestro fork,
-            fallan tests que en el original pasan. Están en `comparacion.json` (clave `nuestras`,
-            con su mensaje en `mensajes`). Los cambios del lote que tocan nuestros arreglos están
-            en `lote.json`, y nuestros arreglos en `scripts/dotech/arreglos.toml`.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
+          TAG: ${{ needs.decidir.outputs.tag }}
+        run: |
+          salida="$RUNNER_TEMP/claude-explicacion.json"
+          echo "execution_file=$salida" >> "$GITHUB_OUTPUT"
+          plantilla=$(cat <<'PROMPT'
+          Tras mezclar la versión __TAG__ del original en nuestro fork,
+          fallan tests que en el original pasan. Están en `comparacion.json` (clave `nuestras`,
+          con su mensaje en `mensajes`). Los cambios del lote que tocan nuestros arreglos están
+          en `lote.json`, y nuestros arreglos en `scripts/dotech/arreglos.toml`.
 
-            Lee el test que falla y los cambios relacionados, y explica en un párrafo corto, en
-            español y sin jerga, la causa probable: qué cambió el original y por qué choca con
-            nuestro arreglo. No propongas código ni toques archivos.
-          claude_args: >-
-            --model claude-haiku-5-5
-            --max-turns 5
-            --setting-sources user
-            --allowedTools "Read,Glob,Grep,Bash(git log:*),Bash(git show:*)"
-            --json-schema '{"type":"object","properties":{"explicacion":{"type":"string"}},"required":["explicacion"]}'
-      # La acción oculta la salida de Claude en el registro, también en modo depuración:
-      # si falla (p. ej. la API rechaza la clave), el motivo se saca del archivo de
-      # ejecución para el informe. El script sale del commit de este workflow, no del
+          Lee el test que falla y los cambios relacionados, y explica en un párrafo corto, en
+          español y sin jerga, la causa probable: qué cambió el original y por qué choca con
+          nuestro arreglo. No propongas código ni toques archivos.
+          PROMPT
+          )
+          shopt -u patsub_replacement 2>/dev/null || true
+          prompt=${plantilla//__TAG__/$TAG}
+          claude -p "$prompt" \
+            --model claude-haiku-5-5 \
+            --max-turns 5 \
+            --max-budget-usd 1 \
+            --setting-sources user \
+            --output-format json \
+            --allowedTools "Read,Glob,Grep,Bash(git log:*),Bash(git show:*)" \
+            --json-schema '{"type":"object","properties":{"explicacion":{"type":"string"}},"required":["explicacion"]}' \
+            </dev/null > "$salida"
+          jq -e '.is_error == false and (.structured_output | type == "object")' "$salida" > /dev/null
+          delim="FIN_$(openssl rand -hex 16)"
+          { echo "structured_output<<$delim"; jq -c '.structured_output' "$salida"; echo "$delim"; } >> "$GITHUB_OUTPUT"
+      # Si Claude falla (p. ej. la API rechaza la llamada), el motivo se saca de su
+      # resultado JSON para el informe. El script sale del commit de este workflow, no del
       # árbol en el que trabajó Claude, y no escribe en ese árbol. Si este paso falla,
       # el informe sale sin motivo, no sin informe.
       - id: fallo_claude
@@ -453,7 +530,7 @@ jobs:
         run: |
           git cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null || git fetch --quiet --no-tags origin "$GITHUB_SHA"
           git show "$GITHUB_SHA:scripts/dotech/error_claude.py" > "$RUNNER_TEMP/error_claude.py"
-          motivo=$(python3 -I "$RUNNER_TEMP/error_claude.py" "${SALIDA:-$RUNNER_TEMP/claude-execution-output.json}")
+          motivo=$(python3 -I "$RUNNER_TEMP/error_claude.py" "${SALIDA:-$RUNNER_TEMP/claude-explicacion.json}")
           echo "::error::Claude falló: $motivo"
           echo "motivo=$motivo" >> "$GITHUB_OUTPUT"
       - id: texto
