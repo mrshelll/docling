@@ -106,6 +106,7 @@ jobs:
       conflicto: ${{ steps.merge.outputs.conflicto }}
       resumen_conflicto: ${{ steps.cerrar.outputs.resumen }}
       archivos_de_mas: ${{ steps.cerrar.outputs.de_mas }}
+      error_claude: ${{ steps.fallo_claude.outputs.motivo }}
     env:
       NOMBRE: ${{ needs.decidir.outputs.autor_nombre }}
       CORREO: ${{ needs.decidir.outputs.autor_correo }}
@@ -153,8 +154,8 @@ jobs:
           install_system_deps: "true"
           cache_models: "true"
       # Un solo intento. continue-on-error: si Claude falla, agota los 45 minutos o no
-      # devuelve el resumen, el informe sale como «Claude no dio por resuelto el
-      # conflicto» (estado rojo) y la rama se publica igual: no se repite el intento.
+      # devuelve el resumen, el informe sale en rojo con el motivo del fallo (paso
+      # siguiente) y la rama se publica igual: no se repite el intento.
       # --setting-sources user: los ajustes de .claude/ del árbol mezclado no cuentan.
       - id: claude
         name: Claude resuelve el conflicto
@@ -193,6 +194,23 @@ jobs:
             --setting-sources user
             --allowedTools "Read,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(uv run --no-sync pytest:*)"
             --json-schema '{"type":"object","properties":{"resuelto":{"type":"boolean"},"archivos":{"type":"array","items":{"type":"object","properties":{"archivo":{"type":"string"},"original":{"type":"string"},"decision":{"type":"string"},"tests":{"type":"string"}},"required":["archivo","original","decision","tests"]}}},"required":["resuelto","archivos"]}'
+      # La acción oculta la salida de Claude en el registro, también en modo depuración:
+      # si falla (p. ej. la API rechaza la clave), el motivo se saca del archivo de
+      # ejecución para el informe. El script sale del commit de este workflow, no del
+      # árbol en el que trabajó Claude, y no escribe en ese árbol. Si este paso falla,
+      # el informe sale sin motivo, no sin informe.
+      - id: fallo_claude
+        name: ¿Por qué falló Claude?
+        continue-on-error: true
+        if: steps.merge.outputs.conflicto == 'true' && steps.claude.outcome != 'success'
+        env:
+          SALIDA: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          git cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null || git fetch --quiet --no-tags origin "$GITHUB_SHA"
+          git show "$GITHUB_SHA:scripts/dotech/error_claude.py" > "$RUNNER_TEMP/error_claude.py"
+          motivo=$(python3 -I "$RUNNER_TEMP/error_claude.py" "${SALIDA:-$RUNNER_TEMP/claude-execution-output.json}")
+          echo "::error::Claude falló: $motivo"
+          echo "motivo=$motivo" >> "$GITHUB_OUTPUT"
       # Si quedan marcas se commitea igual y el resumen se vacía (= no resuelto): la
       # solicitud sale en rojo y para revisar a mano, y la siguiente ejecución ve la
       # versión ya en la rama y no vuelve a llamar a Claude. Lo que Claude cambió fuera
@@ -386,6 +404,7 @@ jobs:
     timeout-minutes: 20
     outputs:
       explicacion: ${{ steps.texto.outputs.explicacion }}
+      error_claude: ${{ steps.fallo_claude.outputs.motivo }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -395,10 +414,12 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: informe-datos
-      # Si Claude falla, la solicitud sale sin explicación, no sin informe.
+      # Si Claude falla, la solicitud sale sin explicación, no sin informe. El límite va
+      # en el paso y no solo en el job: así, si se agota, fallo_claude aún corre.
       - id: claude
         name: Claude explica los fallos nuestros
         continue-on-error: true
+        timeout-minutes: 15
         uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -418,6 +439,23 @@ jobs:
             --setting-sources user
             --allowedTools "Read,Glob,Grep,Bash(git log:*),Bash(git show:*)"
             --json-schema '{"type":"object","properties":{"explicacion":{"type":"string"}},"required":["explicacion"]}'
+      # La acción oculta la salida de Claude en el registro, también en modo depuración:
+      # si falla (p. ej. la API rechaza la clave), el motivo se saca del archivo de
+      # ejecución para el informe. El script sale del commit de este workflow, no del
+      # árbol en el que trabajó Claude, y no escribe en ese árbol. Si este paso falla,
+      # el informe sale sin motivo, no sin informe.
+      - id: fallo_claude
+        name: ¿Por qué falló Claude?
+        continue-on-error: true
+        if: steps.claude.outcome != 'success'
+        env:
+          SALIDA: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          git cat-file -e "$GITHUB_SHA^{commit}" 2>/dev/null || git fetch --quiet --no-tags origin "$GITHUB_SHA"
+          git show "$GITHUB_SHA:scripts/dotech/error_claude.py" > "$RUNNER_TEMP/error_claude.py"
+          motivo=$(python3 -I "$RUNNER_TEMP/error_claude.py" "${SALIDA:-$RUNNER_TEMP/claude-execution-output.json}")
+          echo "::error::Claude falló: $motivo"
+          echo "motivo=$motivo" >> "$GITHUB_OUTPUT"
       - id: texto
         name: Extraer la explicación
         env:
@@ -513,6 +551,8 @@ jobs:
           MARCAS: ${{ steps.revision.outputs.marcas }}
           ARCHIVOS_DE_MAS: ${{ needs.preparar.outputs.archivos_de_mas }}
           ARCHIVOS_PROPIOS: ${{ steps.revision.outputs.propios }}
+          ERROR_CLAUDE_CONFLICTO: ${{ needs.preparar.outputs.error_claude }}
+          ERROR_CLAUDE_EXPLICAR: ${{ needs.explicar.outputs.error_claude }}
         run: |
           d="$RUNNER_TEMP/datos"
           python3 scripts/dotech/informe.py --registro scripts/dotech/arreglos.toml \

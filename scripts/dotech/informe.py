@@ -65,8 +65,11 @@ def revisar_a_mano(
 
 def estado_tests(
     comparacion: dict, conflicto: bool, resumen_conflicto: dict | None, alertas: Alertas = Alertas(),
+    error_claude: str = "",
 ) -> tuple[str, str]:
     if conflicto and not _conflicto_resuelto(resumen_conflicto):
+        if error_claude:
+            return "failure", " ".join(f"Claude falló: {error_claude}".split())[:140]
         return "failure", "Claude no dio por resuelto el conflicto"
     if motivo := alertas.motivo():
         return "failure", motivo[:140]
@@ -123,12 +126,23 @@ def _revisar_a_mano(alertas: Alertas) -> list[str]:
     return l
 
 
-def _seccion_conflicto(conflicto: bool, resumen_conflicto: dict | None) -> list[str]:
+def _motivo_del_fallo(error_claude: str) -> list[str]:
+    """Claude no llegó a trabajar o se cortó: el motivo real, no «no lo resolvió»."""
+    return [f"**La ejecución de Claude falló**, así que no llegó a resolverlo. Motivo: {_celda(error_claude)}",
+            "",
+            "Si el motivo habla de la clave, el saldo o el acceso al modelo, revisa `ANTHROPIC_API_KEY` "
+            "en el entorno `dotech`. Revisar a mano.", ""]
+
+
+def _seccion_conflicto(conflicto: bool, resumen_conflicto: dict | None, error_claude: str = "") -> list[str]:
     if not conflicto:
         return []
     l = ["## Conflicto resuelto por Claude (Sonnet)", ""]
     if not _conflicto_resuelto(resumen_conflicto):
-        l += ["**Claude no lo dio por resuelto.** Revisar a mano.", ""]
+        if error_claude:
+            l += _motivo_del_fallo(error_claude)
+        else:
+            l += ["**Claude no lo dio por resuelto.** Revisar a mano.", ""]
     archivos = (resumen_conflicto or {}).get("archivos", [])
     archivos = [x for x in archivos if isinstance(x, dict)] if isinstance(archivos, list) else []
     if archivos:
@@ -141,6 +155,7 @@ def _seccion_conflicto(conflicto: bool, resumen_conflicto: dict | None) -> list[
 
 def comentario_conflicto(
     *, tag: str, conflicto: bool, resumen_conflicto: dict | None, alertas: Alertas = Alertas(),
+    error_claude: str = "",
 ) -> str:
     """Copia del resumen del conflicto que sobrevive a que otra versión reescriba el cuerpo.
 
@@ -150,7 +165,7 @@ def comentario_conflicto(
         return ""
     l = [f"<!-- dotech:conflicto {re.sub(r'[^0-9A-Za-z._-]', '_', tag)} -->",
          f"Conflicto al pasar a **{_celda(tag)}**.", ""]
-    l += _seccion_conflicto(conflicto, resumen_conflicto)
+    l += _seccion_conflicto(conflicto, resumen_conflicto, error_claude)
     if alertas.fuera_del_conflicto:
         l += ["**Claude cambió también archivos que no estaban en conflicto** (no se revirtieron):"]
         l += _lista_de_archivos(alertas.fuera_del_conflicto) + [""]
@@ -160,7 +175,7 @@ def comentario_conflicto(
 def cuerpo(
     *, tag: str, tag_anterior: str, arreglos: list[Arreglo], sobra: dict, comparacion: dict,
     lote: dict, conflicto: bool, resumen_conflicto: dict | None, explicacion: str, enlace: str,
-    alertas: Alertas = Alertas(),
+    alertas: Alertas = Alertas(), error_claude: str = "", error_explicar: str = "",
 ) -> str:
     l = [f"Pasar de **{tag_anterior}** a **{tag}** del proyecto original.", "",
          f"[Ejecución que generó este informe]({enlace})", ""]
@@ -185,6 +200,9 @@ def cuerpo(
     if explicacion:
         l += ["", "### Causa probable (Claude Haiku)", ""]
         l += [f"> {_seguro(linea)}".rstrip() for linea in explicacion.strip().splitlines()]
+    elif error_explicar:
+        l += ["", "### Causa probable (Claude Haiku)", "",
+              f"**La ejecución de Claude falló**, así que no hay explicación. Motivo: {_celda(error_explicar)}"]
 
     l += ["", "## Cambios del lote que nos tocan", ""]
     por_nombre = {a.clave: a.nombre for a in arreglos}
@@ -205,7 +223,7 @@ def cuerpo(
               "con `pull_request` o `pull_request_target` ya corren al abrir o actualizar esta "
               "solicitud.", ""]
 
-    l += _seccion_conflicto(conflicto, resumen_conflicto)
+    l += _seccion_conflicto(conflicto, resumen_conflicto, error_claude)
 
     l += ["## Antes de aprobar", "",
           "- [ ] Validación con documentos reales: la hace sola el servidor DOTECH (estado `dotech/validacion-local`); a mano: `docling-validar <número>` en el Mac de Miguel",
@@ -254,6 +272,9 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     conflicto = os.environ.get("CONFLICTO", "false") == "true"
+    # Motivo del fallo de Claude (una línea, de error_claude.py); vacío si no falló.
+    error_claude = os.environ.get("ERROR_CLAUDE_CONFLICTO", "").strip()
+    error_explicar = os.environ.get("ERROR_CLAUDE_EXPLICAR", "").strip()
     resumen = resumen_del_entorno()
     alertas = alertas_del_entorno()
     comparacion = _json(a.comparacion)
@@ -263,13 +284,14 @@ def main(argv: list[str] | None = None) -> int:
         tag=a.tag, tag_anterior=a.tag_anterior, arreglos=cargar(a.registro), sobra=sobra,
         comparacion=comparacion, lote=_json(a.lote), conflicto=conflicto,
         resumen_conflicto=resumen, explicacion=os.environ.get("EXPLICACION", ""), enlace=a.enlace,
-        alertas=alertas,
+        alertas=alertas, error_claude=error_claude, error_explicar=error_explicar,
     ), encoding="utf-8")
     if a.salida_comentario:
         a.salida_comentario.write_text(comentario_conflicto(
             tag=a.tag, conflicto=conflicto, resumen_conflicto=resumen, alertas=alertas,
+            error_claude=error_claude,
         ), encoding="utf-8")
-    estado, descripcion = estado_tests(comparacion, conflicto, resumen, alertas)
+    estado, descripcion = estado_tests(comparacion, conflicto, resumen, alertas, error_claude)
     print(f"titulo={titulo(a.tag, revisar_a_mano(comparacion, conflicto, resumen, alertas))}")
     print(f"estado={estado}")
     print(f"descripcion={descripcion}")
