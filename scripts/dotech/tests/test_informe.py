@@ -151,7 +151,7 @@ def test_aviso_de_workflows_nuevos_menciona_pull_request():
 
 MARCADO = "[conflicto para revisar a mano] Pasar a v2.138.0"
 _VARIABLES = ("CONFLICTO", "RESUMEN_CONFLICTO", "EXPLICACION", "TITULO_ACTUAL", "MARCAS",
-              "ARCHIVOS_DE_MAS", "ARCHIVOS_PROPIOS")
+              "ARCHIVOS_DE_MAS", "ARCHIVOS_PROPIOS", "ERROR_CLAUDE_CONFLICTO", "ERROR_CLAUDE_EXPLICAR")
 
 
 def _main(tmp_path, monkeypatch, capsys, comparacion=LIMPIA, **entorno):
@@ -250,3 +250,43 @@ def test_estado_con_alertas(alertas):
     assert e == "failure"
     assert 0 < len(descripcion) <= 140
     assert revisar_a_mano(LIMPIA, False, None, Alertas(**alertas))
+
+
+def test_si_claude_falla_el_informe_da_el_motivo_y_no_dice_que_no_lo_resolvio(tmp_path, monkeypatch, capsys):
+    # La API rechazó la llamada: el resumen está vacío, pero no es que Claude «no lo resolviera».
+    motivo = "Invalid API key · Fix external API key"
+    salidas, cuerpo_, comentario = _main(tmp_path, monkeypatch, capsys, CONFLICTO="true",
+                                         ERROR_CLAUDE_CONFLICTO=motivo)
+    assert salidas["titulo"].startswith("[conflicto para revisar a mano]")
+    assert salidas["estado"] == "failure"
+    assert salidas["descripcion"] == f"Claude falló: {motivo}"
+    for texto in (cuerpo_, comentario):
+        assert "La ejecución de Claude falló" in texto and motivo in texto
+        assert "ANTHROPIC_API_KEY" in texto
+        assert "no lo dio por resuelto" not in texto
+
+
+def test_sin_fallo_de_claude_sigue_diciendo_que_no_lo_resolvio(tmp_path, monkeypatch, capsys):
+    import json
+    salidas, cuerpo_, _ = _main(tmp_path, monkeypatch, capsys, CONFLICTO="true",
+                                RESUMEN_CONFLICTO=json.dumps({"resuelto": False, "archivos": []}))
+    assert salidas["descripcion"] == "Claude no dio por resuelto el conflicto"
+    assert "no lo dio por resuelto" in cuerpo_ and "La ejecución de Claude falló" not in cuerpo_
+
+
+def test_motivo_largo_o_hostil_queda_acotado_y_neutralizado(tmp_path, monkeypatch, capsys):
+    motivo = "API Error: 400 @alguien <b> | " + "x" * 400
+    salidas, cuerpo_, _ = _main(tmp_path, monkeypatch, capsys, CONFLICTO="true",
+                                ERROR_CLAUDE_CONFLICTO=motivo)
+    assert len(salidas["descripcion"]) <= 140
+    assert "@alguien" not in cuerpo_ and "<b>" not in cuerpo_
+
+
+def test_si_falla_la_explicacion_el_informe_lo_dice(tmp_path, monkeypatch, capsys):
+    _, cuerpo_, _ = _main(tmp_path, monkeypatch, capsys, CON_NUESTRAS, CONFLICTO="false",
+                          ERROR_CLAUDE_EXPLICAR="Credit balance is too low")
+    assert "### Causa probable" in cuerpo_ and "Credit balance is too low" in cuerpo_
+    # Con explicación, el motivo de un fallo anterior no aparece.
+    _, cuerpo_, _ = _main(tmp_path, monkeypatch, capsys, CON_NUESTRAS, CONFLICTO="false",
+                          EXPLICACION="Causa: X", ERROR_CLAUDE_EXPLICAR="viejo")
+    assert "Causa: X" in cuerpo_ and "viejo" not in cuerpo_
