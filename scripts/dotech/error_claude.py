@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: MIT
 """Por qué falló una llamada a Claude, en una línea, para el informe.
 
-claude-code-action oculta la salida de Claude en el registro, también en modo
-depuración. Si la API rechaza la llamada (clave inválida, sin saldo, sin permiso
-para el modelo), el registro solo dice «did not return structured_output» y el
-informe lo confundía con «Claude no lo dio por resuelto». El mensaje real está en
-el archivo de ejecución (`execution_file`): este script lo saca.
+Si la API rechaza la llamada (clave inválida, sin saldo, sin permiso para el
+modelo), el informe no debe confundirlo con «Claude no lo dio por resuelto». El
+mensaje real está en el resultado JSON de `claude -p --output-format json` (antes,
+en el archivo de ejecución de claude-code-action, que lo ocultaba en el registro):
+este script lo saca.
 
-Uso: error_claude.py <execution_file>  →  imprime el motivo (una línea) o nada.
+Uso: error_claude.py <resultado.json>  →  imprime el motivo, en una línea.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ import sys
 from pathlib import Path
 
 LARGO_MAXIMO = 500
-SIN_ARCHIVO = ("la acción de Claude no dejó archivo de ejecución: se agotó el tiempo o falló "
-               "antes de arrancar (ver el registro de la ejecución)")
-SIN_RESULTADO = "el archivo de ejecución de Claude no trae resultado final (ver el registro)"
+SIN_ARCHIVO = ("Claude no dejó resultado: no se pudo instalar, falló antes de arrancar o se "
+               "agotó el tiempo (ver el registro de la ejecución)")
+SIN_RESULTADO = "el resultado de Claude no trae el mensaje final (ver el registro)"
 SIN_RESUMEN = "Claude terminó sin error pero no devolvió el resumen estructurado"
 
 

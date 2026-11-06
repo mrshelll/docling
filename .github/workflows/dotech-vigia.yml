@@ -157,6 +157,7 @@ jobs:
           install_system_deps: "true"
           cache_models: "true"
       - if: steps.merge.outputs.conflicto == 'true'
+        continue-on-error: true
         uses: actions/setup-node@v6
         with:
           node-version: 22
@@ -231,6 +232,7 @@ jobs:
             --max-turns 40 \
             --max-budget-usd 10 \
             --setting-sources user \
+            --permission-prompts none \
             --output-format json \
             --allowedTools "Read,Edit,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git status:*),Bash(uv run --no-sync pytest:*)" \
             --json-schema "$esquema" \
@@ -458,6 +460,7 @@ jobs:
         with:
           name: informe-datos
       - uses: actions/setup-node@v6
+        continue-on-error: true
         with:
           node-version: 22
       # Claude se llama directo con `claude -p`, como el radar semanal, y no con
@@ -510,6 +513,7 @@ jobs:
             --max-turns 5 \
             --max-budget-usd 1 \
             --setting-sources user \
+            --permission-prompts none \
             --output-format json \
             --allowedTools "Read,Glob,Grep,Bash(git log:*),Bash(git show:*)" \
             --json-schema '{"type":"object","properties":{"explicacion":{"type":"string"}},"required":["explicacion"]}' \
